@@ -28,7 +28,7 @@ permissions:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       # 抽签步骤：没中签的触发点在这里几秒退出，不产生实质消耗
       - name: Decide slot
@@ -91,6 +91,9 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           TARGET_USERS: ${{ vars.TARGET_USERS }}
+          # ---- 预算（每账户每天请求数 / 每天跑几波）----
+          DAILY_CALLS: ${{ vars.DAILY_CALLS }}
+          RUNS_PER_DAY: ${{ vars.RUNS_PER_DAY }}
           MIN_CALLS: ${{ vars.MIN_CALLS }}
           MAX_CALLS: ${{ vars.MAX_CALLS }}
           ENABLE_WRITES: ${{ vars.ENABLE_WRITES }}
