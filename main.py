@@ -7,6 +7,7 @@ E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
 - 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
 - 推送附带订阅状态、到期时间、今日请求累计
+- 日志脱敏：UPN / GUID / 密码自动打码（REDACT_LOGS=false 可关闭）
 - 写操作即建即删；404/507 跳过；429/5xx 退避重试
 """
 
@@ -31,6 +32,35 @@ TOKEN_ENDPOINT = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 STATE_FILE = os.getenv("STATE_FILE", ".e5_state.json")
 
 log = logging.getLogger("e5-keepalive")
+
+
+# --------------------------------------------------------------------------- #
+# 日志脱敏（开源发布时隐藏 UPN / GUID / 密码）
+# --------------------------------------------------------------------------- #
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
+_GUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+_SECRET_RE = re.compile(r"(?i)(\"[^\"]*secret[^\"]*\"\s*:\s*\")[^\"]*")
+
+
+def _mask_email(m: re.Match) -> str:
+    name, _, domain = m.group(0).partition("@")
+    return f"{name[:2]}***@{domain[:1]}***"
+
+
+def redact_text(msg: str) -> str:
+    msg = _EMAIL_RE.sub(_mask_email, msg)
+    msg = _GUID_RE.sub(lambda m: m.group(0)[:4] + "***", msg)
+    msg = _SECRET_RE.sub(r"\1***", msg)
+    return msg
+
+
+class RedactFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_text(record.getMessage())
+        record.args = ()
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -669,6 +699,10 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    if os.getenv("REDACT_LOGS", "true").strip().lower() != "false":
+        for h in logging.getLogger().handlers:
+            h.addFilter(RedactFilter())
+
     accounts = load_accounts()
     if not accounts:
         log.error("没有任何可用账户，请检查 Secrets 配置")
@@ -714,6 +748,7 @@ def main() -> int:
             seg += f" ｜ 到期 {r.get('expiry') or '未查到（配置 expiry 或等微软邮件）'}"
             lines.append(seg)
     body = f"运行时间 {now_str}，耗时 {duration}s\n\n" + "\n".join(lines)
+    body = redact_text(body)
 
     write_step_summary("## " + title + "\n\n" + body + "\n")
 
