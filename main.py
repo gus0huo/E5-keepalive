@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
-- OAuth 2.0 client_credentials 流程，凭证仅来自环境变量 / GitHub Secrets
-- 随机选取只读 + 可回滚的写操作（草稿/日历/文件夹，创建后立即删除）
-- 429/5xx 指数退避并遵循 Retry-After，401 自动刷新 token
+- OAuth 2.0 client_credentials 流程，凭证仅来自 GitHub Secrets
+- 可通过 TARGET_USERS 变量指定只跑哪几个账号
+- 写操作（草稿/日历/文件夹）创建后立即删除，不留残留
+- 429/5xx 指数退避；404/507（对方账号问题）直接跳过，不重试
 """
 
 from __future__ import annotations
@@ -99,6 +100,7 @@ class GraphClient:
         self.http = requests.Session()
         self.ok = 0
         self.fail = 0
+        self.skip = 0
 
     def call(self, method: str, path: str, **kwargs) -> requests.Response | None:
         url = path if path.startswith("http") else GRAPH + path
@@ -114,6 +116,14 @@ class GraphClient:
                 log.warning("401，刷新 token 后重试")
                 self.tokens.invalidate()
                 continue
+            # 404（未开通 OneDrive）、507（存储已满）重试无意义，直接跳过
+            if resp.status_code in (404, 507):
+                self.skip += 1
+                log.info(
+                    "%s %s -> %s，跳过（对方账号问题，不影响结果）",
+                    method, path, resp.status_code,
+                )
+                return resp
             if resp.status_code == 429 or resp.status_code >= 500:
                 wait = min(int(resp.headers.get("Retry-After", 2 ** attempt)), 120)
                 log.warning("%s %s -> %s，%ss 后重试", method, path, resp.status_code, wait)
@@ -154,7 +164,7 @@ def read_endpoints(uid: str) -> list[tuple[str, str]]:
 
 
 # --------------------------------------------------------------------------- #
-# 可回滚的写操作：创建后立即删除，不产生残留
+# 可回滚的写操作：创建后立即删除
 # --------------------------------------------------------------------------- #
 def write_draft(client: GraphClient, uid: str) -> None:
     tag = datetime.now(timezone.utc).strftime("%m%d%H%M%S")
@@ -215,6 +225,8 @@ def resolve_users(client: GraphClient, cfg: Config) -> list[str]:
             resp = client.call("GET", f"/users/{upn}?$select=id,userPrincipalName")
             if resp is not None and resp.ok:
                 ids.append((resp.json() or {}).get("id", ""))
+            else:
+                log.warning("找不到用户 %s，请检查 UPN 是否写对", upn)
         return [i for i in ids if i]
     resp = client.call("GET", "/users?$select=id&$top=25")
     if resp is None or not resp.ok:
@@ -234,31 +246,26 @@ def main() -> int:
     client = GraphClient(TokenProvider(cfg))
     users = resolve_users(client, cfg)
     if not users:
-        log.error("未获取到任何用户，请检查 User.Read.All 权限及管理员同意状态")
+        log.error("未获取到任何用户，请检查 User.Read.All 权限、管理员同意、TARGET_USERS 写法")
         return 1
     log.info("目标用户数: %d", len(users))
 
-    # 组装执行计划：只读调用随机抽取，写操作保证至少跑一轮
-    read_jobs: list[tuple[str, str]] = []
+    # 每个用户：4 个随机只读 + 1 个随机写，再按预算抽样
+    candidates: list[tuple[str, str]] = []
     for uid in users:
-        read_jobs.extend(read_endpoints(uid))
-    random.shuffle(read_jobs)
-
-    write_jobs = []
-    if cfg.enable_writes:
-        for uid in users:
-            write_jobs.extend(
-                [
-                    ("DRAFT", uid),
-                    ("EVENT", uid),
-                    ("FOLDER", uid),
-                ]
-            )
+        endpoints = read_endpoints(uid)
+        random.shuffle(endpoints)
+        candidates.extend(endpoints[:4])
+        if cfg.enable_writes:
+            candidates.append((random.choice(["DRAFT", "EVENT", "FOLDER"]), uid))
+    random.shuffle(candidates)
 
     budget = random.randint(cfg.min_calls, cfg.max_calls)
-    selected = read_jobs[: max(budget - len(write_jobs), 0)] + write_jobs
-    random.shuffle(selected)
-    log.info("本次计划执行 %d 个动作（预算 %d）", len(selected), budget)
+    selected = candidates[:budget]
+    log.info(
+        "本次计划执行 %d 个动作（预算 %d，候选 %d）",
+        len(selected), budget, len(candidates),
+    )
 
     for i, job in enumerate(selected, 1):
         kind = job[0]
@@ -273,9 +280,12 @@ def main() -> int:
         if i < len(selected):
             time.sleep(random.uniform(0.6, 2.8))
 
-    log.info("执行完毕: 成功 %d，失败 %d", client.ok, client.fail)
+    log.info("执行完毕: 成功 %d，失败 %d，跳过 %d", client.ok, client.fail, client.skip)
     if os.getenv("GITHUB_ACTIONS") == "true":
-        print(f"::notice title=E5 KeepAlive::成功 {client.ok} 次调用，失败 {client.fail} 次")
+        print(
+            f"::notice title=E5 KeepAlive::成功 {client.ok} 次，"
+            f"失败 {client.fail} 次，跳过 {client.skip} 次"
+        )
     return 0 if client.ok > 0 else 1
 
 
