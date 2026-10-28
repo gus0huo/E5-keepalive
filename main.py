@@ -4,6 +4,7 @@ E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
 - 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
+- 推送附带订阅状态与到期时间（手动配置 / 从微软通知邮件推算）
 - 写操作即建即删；404/507 跳过；429/5xx 退避重试
 """
 
@@ -13,6 +14,7 @@ import json
 import logging
 import os
 import random
+import re
 import smtplib
 import sys
 import time
@@ -41,6 +43,8 @@ class Account:
     min_calls: int = 18
     max_calls: int = 36
     enable_writes: bool = True
+    expiry: str = ""            # 手动指定到期日，如 "2027-01-20"
+    expiry_scan_user: str = ""  # 扫描哪个邮箱的微软通知邮件（建议填管理员 UPN）
 
 
 def _get_int(name: str, default: int) -> int:
@@ -76,6 +80,8 @@ def load_accounts() -> list[Account]:
                     min_calls=int(it.get("min_calls", default_min)),
                     max_calls=int(it.get("max_calls", default_max)),
                     enable_writes=bool(it.get("enable_writes", default_writes)),
+                    expiry=str(it.get("expiry", "")).strip(),
+                    expiry_scan_user=str(it.get("expiry_scan_user", "")).strip(),
                 )
             )
     else:
@@ -92,6 +98,8 @@ def load_accounts() -> list[Account]:
                 min_calls=default_min,
                 max_calls=default_max,
                 enable_writes=default_writes,
+                expiry=os.getenv("EXPIRY_DATE", "").strip(),
+                expiry_scan_user=os.getenv("EXPIRY_SCAN_USER", "").strip(),
             )
         )
 
@@ -191,6 +199,106 @@ class GraphClient:
 
 
 # --------------------------------------------------------------------------- #
+# 订阅状态与到期时间
+# --------------------------------------------------------------------------- #
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _plain_get(tokens: TokenProvider, path: str):
+    """静默 GET：失败只记日志，不计入成功/失败统计，绝不影响主流程。"""
+    try:
+        resp = requests.get(
+            GRAPH + path,
+            headers={"Authorization": f"Bearer {tokens.get()}"},
+            timeout=30,
+        )
+    except Exception as exc:
+        log.info("订阅信息查询异常，已忽略: %s", exc)
+        return None
+    if resp.ok:
+        return resp.json()
+    log.info("订阅信息查询未成功（HTTP %s），已忽略", resp.status_code)
+    return None
+
+
+def _extract_date(text: str, base: datetime | None) -> str:
+    """从文本提取日期：显式日期优先，其次 'in N days / N 天' 相对推算。"""
+    m = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})", text)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.search(
+        r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*,?\s+(20\d{2})\b",
+        text,
+        re.I,
+    )
+    if m:
+        return f"{m.group(3)}-{_MONTHS[m.group(2).lower()]:02d}-{int(m.group(1)):02d}"
+    if base:
+        m = re.search(r"in\s+(\d{1,3})\s+days", text, re.I)
+        if not m:
+            m = re.search(r"renewed\s+(?:for\s+)?(?:another\s+)?(\d{1,3})\s+days", text, re.I)
+        if not m:
+            m = re.search(r"(\d{1,3})\s*天", text)
+        if m:
+            return (base + timedelta(days=int(m.group(1)))).strftime("%Y-%m-%d")
+    return ""
+
+
+def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str):
+    """返回 (订阅状态摘要, 到期时间线索)。查不到就返回空串。"""
+    # 1) 订阅状态与席位
+    sub = ""
+    data = _plain_get(
+        tokens,
+        "/subscribedSkus?$select=skuPartNumber,capabilityStatus,consumedUnits,prepaidUnits",
+    )
+    if data:
+        bits = []
+        for s in data.get("value", []):
+            enabled = (s.get("prepaidUnits") or {}).get("enabled") or 0
+            bits.append(
+                f"{s.get('skuPartNumber', '?')} {s.get('capabilityStatus', '?')}"
+                f"（{s.get('consumedUnits', 0)}/{enabled} 席）"
+            )
+        sub = "；".join(bits)
+
+    # 2) 到期时间：手动配置 > 邮件推算
+    expiry = ""
+    if acc.expiry:
+        expiry = f"{acc.expiry}（手动配置）"
+    else:
+        uid = acc.expiry_scan_user or fallback_uid
+        if uid:
+            kw = "expires OR expiring OR expiration OR renewal OR renewed OR 续订 OR 续期 OR 到期"
+            data = _plain_get(
+                tokens,
+                f"/users/{uid}/messages?$search=\"{kw}\"&$top=10"
+                "&$select=subject,receivedDateTime,bodyPreview",
+            )
+            if data:
+                msgs = data.get("value", [])
+                msgs.sort(key=lambda m: m.get("receivedDateTime", ""), reverse=True)
+                for msg in msgs:
+                    text = f"{msg.get('subject', '')} {msg.get('bodyPreview', '')}"
+                    base = None
+                    try:
+                        base = datetime.fromisoformat(
+                            msg.get("receivedDateTime", "").replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        pass
+                    d = _extract_date(text, base)
+                    if d:
+                        src = base.strftime("%Y-%m-%d") if base else "未知日期"
+                        expiry = f"{d}（据 {src} 的通知邮件推算）"
+                        break
+    return sub, expiry
+
+
+# --------------------------------------------------------------------------- #
 # 只读 API 列表
 # --------------------------------------------------------------------------- #
 def read_endpoints(uid: str) -> list[tuple[str, str]]:
@@ -269,21 +377,35 @@ def write_folder(client: GraphClient, uid: str) -> None:
 def resolve_users(client: GraphClient, acc: Account) -> list[str]:
     if acc.users:
         ids = []
+        bad = []
         for upn in acc.users:
             resp = client.call("GET", f"/users/{upn}?$select=id,userPrincipalName")
             if resp is not None and resp.ok:
                 ids.append((resp.json() or {}).get("id", ""))
             else:
-                log.warning("[%s] 找不到用户 %s，请检查 UPN", acc.name, upn)
-        return [i for i in ids if i]
+                bad.append(upn)
+                log.warning("[%s] 找不到用户 %s", acc.name, upn)
+        if bad:
+            raise RuntimeError(f"以下 UPN 不存在或无权读取：{', '.join(bad)}")
+        return ids
     resp = client.call("GET", "/users?$select=id&$top=25")
-    if resp is None or not resp.ok:
-        return []
-    return [u["id"] for u in (resp.json() or {}).get("value", [])]
+    if resp is not None and resp.ok:
+        ids = [u["id"] for u in (resp.json() or {}).get("value", [])]
+        if ids:
+            return ids
+        raise RuntimeError("用户列表为空（异常，请检查租户）")
+    code = resp.status_code if resp is not None else "无响应"
+    raise RuntimeError(
+        f"获取用户列表失败（HTTP {code}）——"
+        f"请检查 User.Read.All 是否为【应用程序权限】且已授予管理员同意"
+    )
 
 
 def process_account(acc: Account) -> dict:
-    result = {"name": acc.name, "users": 0, "ok": 0, "fail": 0, "skip": 0, "error": ""}
+    result = {
+        "name": acc.name, "users": 0, "ok": 0, "fail": 0, "skip": 0,
+        "error": "", "sub": "", "expiry": "",
+    }
     log.info("—— 开始处理账户 [%s] ——", acc.name)
     try:
         client = GraphClient(TokenProvider(acc))
@@ -291,6 +413,14 @@ def process_account(acc: Account) -> dict:
         if not users:
             raise RuntimeError("未获取到任何用户（检查权限/管理员同意/UPN）")
         result["users"] = len(users)
+
+        # 订阅状态与到期时间（静默查询，不影响统计）
+        sub, expiry = get_subscription_info(acc, client.tokens, users[0])
+        result["sub"], result["expiry"] = sub, expiry
+        if sub:
+            log.info("[%s] 订阅状态: %s", acc.name, sub)
+        if expiry:
+            log.info("[%s] 到期时间: %s", acc.name, expiry)
 
         candidates: list[tuple[str, str]] = []
         for uid in users:
@@ -425,10 +555,15 @@ def main() -> int:
         if r["error"]:
             lines.append(f"- **{r['name']}**：出错 —— {r['error']}")
         else:
-            lines.append(
+            seg = (
                 f"- **{r['name']}**：用户 {r['users']} 个，成功 {r['ok']}，"
                 f"失败 {r['fail']}，跳过 {r['skip']}"
             )
+            if r.get("sub"):
+                seg += f" ｜ {r['sub']}"
+            if r.get("expiry"):
+                seg += f" ｜ 到期 {r['expiry']}"
+            lines.append(seg)
     body = f"运行时间 {now_str}，耗时 {duration}s\n\n" + "\n".join(lines)
 
     write_step_summary("## " + title + "\n\n" + body + "\n")
