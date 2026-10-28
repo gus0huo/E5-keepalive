@@ -2,6 +2,7 @@
 """
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
+- 预算模型：每账户每天 daily_calls 次请求，按 runs_per_day 和 user 数均摊
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
 - 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
 - 推送附带订阅状态与到期时间（手动配置 / 从微软通知邮件推算）
@@ -40,11 +41,13 @@ class Account:
     client_id: str
     client_secret: str
     users: list[str] = field(default_factory=list)  # 空 = 租户内前 25 个用户
-    min_calls: int = 18
+    daily_calls: int = 80        # 每天总请求数（设 0 则退回 min/max 随机模式）
+    runs_per_day: int = 2        # 每天跑几次（上午场 + 下午场 = 2）
+    min_calls: int = 18          # 旧随机模式用，daily_calls=0 时生效
     max_calls: int = 36
     enable_writes: bool = True
-    expiry: str = ""            # 手动指定到期日，如 "2027-01-20"
-    expiry_scan_user: str = ""  # 扫描哪个邮箱的微软通知邮件（建议填管理员 UPN）
+    expiry: str = ""             # 手动指定到期日，如 "2027-01-20"
+    expiry_scan_user: str = ""   # 扫描哪个邮箱的微软通知邮件（建议填管理员 UPN）
 
 
 def _get_int(name: str, default: int) -> int:
@@ -58,6 +61,8 @@ def _get_int(name: str, default: int) -> int:
 def load_accounts() -> list[Account]:
     """优先读 E5_ACCOUNTS(JSON)；否则退回单账户三件套环境变量。"""
     raw = os.getenv("E5_ACCOUNTS", "").strip()
+    env_daily = _get_int("DAILY_CALLS", 80)
+    env_runs = _get_int("RUNS_PER_DAY", 2)
     default_min = _get_int("MIN_CALLS", 18)
     default_max = _get_int("MAX_CALLS", 36)
     default_writes = os.getenv("ENABLE_WRITES", "true").strip().lower() != "false"
@@ -77,6 +82,8 @@ def load_accounts() -> list[Account]:
                     client_id=it.get("client_id", ""),
                     client_secret=it.get("client_secret", ""),
                     users=[u.strip() for u in it.get("users", []) if u.strip()],
+                    daily_calls=int(it.get("daily_calls", env_daily)),
+                    runs_per_day=int(it.get("runs_per_day", env_runs)),
                     min_calls=int(it.get("min_calls", default_min)),
                     max_calls=int(it.get("max_calls", default_max)),
                     enable_writes=bool(it.get("enable_writes", default_writes)),
@@ -95,6 +102,8 @@ def load_accounts() -> list[Account]:
                 client_id=os.getenv("AZURE_CLIENT_ID", ""),
                 client_secret=os.getenv("AZURE_CLIENT_SECRET", ""),
                 users=env_users,
+                daily_calls=env_daily,
+                runs_per_day=env_runs,
                 min_calls=default_min,
                 max_calls=default_max,
                 enable_writes=default_writes,
@@ -108,6 +117,8 @@ def load_accounts() -> list[Account]:
         if acc.client_id and acc.client_secret:
             if acc.min_calls > acc.max_calls:
                 acc.min_calls, acc.max_calls = acc.max_calls, acc.min_calls
+            if acc.runs_per_day < 1:
+                acc.runs_per_day = 1
             valid.append(acc)
         else:
             log.warning("账户 %s 缺少 client_id/client_secret，已跳过", acc.name)
@@ -249,7 +260,6 @@ def _extract_date(text: str, base: datetime | None) -> str:
 
 def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str):
     """返回 (订阅状态摘要, 到期时间线索)。查不到就返回空串。"""
-    # 1) 订阅状态与席位
     sub = ""
     data = _plain_get(
         tokens,
@@ -265,7 +275,6 @@ def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str
             )
         sub = "；".join(bits)
 
-    # 2) 到期时间：手动配置 > 邮件推算
     expiry = ""
     if acc.expiry:
         expiry = f"{acc.expiry}（手动配置）"
@@ -372,8 +381,30 @@ def write_folder(client: GraphClient, uid: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 单账户处理
+# 预算分摊与单账户处理
 # --------------------------------------------------------------------------- #
+def plan_user_jobs(uid: str, budget: int, enable_writes: bool) -> tuple[list, int]:
+    """把 budget 个请求分给单个用户。GET=1 次，写操作=2 次。"""
+    jobs: list[tuple[str, str]] = []
+    used = 0
+    if budget <= 0:
+        return jobs, used
+    if enable_writes and budget >= 3:
+        jobs.append((random.choice(["DRAFT", "EVENT", "FOLDER"]), uid))
+        used += 2
+    gets = read_endpoints(uid)
+    random.shuffle(gets)
+    i = 0
+    while used < budget:
+        if i >= len(gets):
+            i = 0
+            random.shuffle(gets)   # 额度超过接口数时允许重复随机取
+        jobs.append(gets[i])
+        used += 1
+        i += 1
+    return jobs, used
+
+
 def resolve_users(client: GraphClient, acc: Account) -> list[str]:
     if acc.users:
         ids = []
@@ -422,20 +453,36 @@ def process_account(acc: Account) -> dict:
         if expiry:
             log.info("[%s] 到期时间: %s", acc.name, expiry)
 
-        candidates: list[tuple[str, str]] = []
-        for uid in users:
-            endpoints = read_endpoints(uid)
-            random.shuffle(endpoints)
-            candidates.extend(endpoints[:4])
-            if acc.enable_writes:
-                candidates.append((random.choice(["DRAFT", "EVENT", "FOLDER"]), uid))
-        random.shuffle(candidates)
+        # ---- 预算：每天 daily_calls ÷ runs_per_day，再按用户均摊 ----
+        if acc.daily_calls > 0:
+            run_budget = acc.daily_calls // acc.runs_per_day
+            log.info(
+                "[%s] 预算：每天 %d 次 ÷ %d 波 = 本次 %d 次",
+                acc.name, acc.daily_calls, acc.runs_per_day, run_budget,
+            )
+        else:
+            run_budget = random.randint(acc.min_calls, acc.max_calls)
+            log.info("[%s] 随机预算模式：%d 次", acc.name, run_budget)
 
-        budget = random.randint(acc.min_calls, acc.max_calls)
-        selected = candidates[:budget]
+        base, remainder = divmod(run_budget, len(users))
+        if base == 0:
+            log.warning(
+                "[%s] 每用户预算过低（%d），建议提高 daily_calls 或减少 users",
+                acc.name, base,
+            )
+
+        selected: list[tuple[str, str]] = []
+        total_req = 0
+        for idx, uid in enumerate(users):
+            user_budget = base + (1 if idx < remainder else 0)
+            jobs_u, used = plan_user_jobs(uid, user_budget, acc.enable_writes)
+            selected.extend(jobs_u)
+            total_req += used
+        random.shuffle(selected)
         log.info(
-            "[%s] 计划 %d 个动作（预算 %d，候选 %d）",
-            acc.name, len(selected), budget, len(candidates),
+            "[%s] 计划 %d 个动作，共 %d 个请求（%d 个用户，每人 %d~%d 次）",
+            acc.name, len(selected), total_req, len(users),
+            base + (1 if remainder else 0), base,
         )
 
         for i, job in enumerate(selected, 1):
@@ -559,10 +606,8 @@ def main() -> int:
                 f"- **{r['name']}**：用户 {r['users']} 个，成功 {r['ok']}，"
                 f"失败 {r['fail']}，跳过 {r['skip']}"
             )
-            if r.get("sub"):
-                seg += f" ｜ {r['sub']}"
-            if r.get("expiry"):
-                seg += f" ｜ 到期 {r['expiry']}"
+            seg += f" ｜ {r.get('sub') or '订阅状态未查到'}"
+            seg += f" ｜ 到期 {r.get('expiry') or '未查到（配置 expiry 或等微软邮件）'}"
             lines.append(seg)
     body = f"运行时间 {now_str}，耗时 {duration}s\n\n" + "\n".join(lines)
 
