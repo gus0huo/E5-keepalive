@@ -2,7 +2,8 @@
 """
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
-- 预算模型：每账户每天恰好 daily_calls 次请求，跨上午/下午两波累计记账
+- 预算模型：每账户每天恰好 N 次请求；N 可固定(80)或区间随机("70-90"，每天抽一次)
+- 跨上午/下午两波累计记账，账本持久化在 .e5_state.json
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
 - 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
 - 推送附带订阅状态、到期时间、今日请求累计
@@ -42,9 +43,10 @@ class Account:
     client_id: str
     client_secret: str
     users: list[str] = field(default_factory=list)  # 空 = 租户内前 25 个用户
-    daily_calls: int = 80        # 每天总请求数（设 0 则退回 min/max 随机模式）
+    daily_min: int = 80          # 每天总请求数下限
+    daily_max: int = 80          # 每天总请求数上限（= 下限则为固定值；均为 0 退回随机模式）
     runs_per_day: int = 2        # 每天跑几波（仅用于日志参考）
-    min_calls: int = 18          # 旧随机模式用，daily_calls=0 时生效
+    min_calls: int = 18          # 旧随机模式用，daily 为 0 时生效
     max_calls: int = 36
     enable_writes: bool = True
     expiry: str = ""             # 手动指定到期日，如 "2027-01-20"
@@ -59,10 +61,30 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _parse_calls(value, default: tuple[int, int] = (80, 80)) -> tuple[int, int]:
+    """解析请求数：80 → (80, 80)；"70-90" → (70, 90)；非法值回退默认。"""
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        v = int(value)
+        return v, v
+    s = str(value).strip()
+    if not s:
+        return default
+    m = re.match(r"^(\d+)\s*[-~—]\s*(\d+)$", s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return (a, b) if a <= b else (b, a)
+    if s.isdigit():
+        v = int(s)
+        return v, v
+    return default
+
+
 def load_accounts() -> list[Account]:
     """优先读 E5_ACCOUNTS(JSON)；否则退回单账户三件套环境变量。"""
     raw = os.getenv("E5_ACCOUNTS", "").strip()
-    env_daily = _get_int("DAILY_CALLS", 80)
+    env_calls = _parse_calls(os.getenv("DAILY_CALLS", "").strip() or None)
     env_runs = _get_int("RUNS_PER_DAY", 2)
     default_min = _get_int("MIN_CALLS", 18)
     default_max = _get_int("MAX_CALLS", 36)
@@ -80,6 +102,7 @@ def load_accounts() -> list[Account]:
                 log.error("%s 第 %d 行: %s", marker, i, raw_lines[i - 1])
             sys.exit(2)
         for i, it in enumerate(items, 1):
+            dmin, dmax = _parse_calls(it.get("daily_calls"), env_calls)
             accounts.append(
                 Account(
                     name=it.get("name") or f"账户{i}",
@@ -87,7 +110,8 @@ def load_accounts() -> list[Account]:
                     client_id=it.get("client_id", ""),
                     client_secret=it.get("client_secret", ""),
                     users=[u.strip() for u in it.get("users", []) if u.strip()],
-                    daily_calls=int(it.get("daily_calls", env_daily)),
+                    daily_min=dmin,
+                    daily_max=dmax,
                     runs_per_day=int(it.get("runs_per_day", env_runs)),
                     min_calls=int(it.get("min_calls", default_min)),
                     max_calls=int(it.get("max_calls", default_max)),
@@ -107,7 +131,8 @@ def load_accounts() -> list[Account]:
                 client_id=os.getenv("AZURE_CLIENT_ID", ""),
                 client_secret=os.getenv("AZURE_CLIENT_SECRET", ""),
                 users=env_users,
-                daily_calls=env_daily,
+                daily_min=env_calls[0],
+                daily_max=env_calls[1],
                 runs_per_day=env_runs,
                 min_calls=default_min,
                 max_calls=default_max,
@@ -131,7 +156,7 @@ def load_accounts() -> list[Account]:
 
 
 # --------------------------------------------------------------------------- #
-# 每日记账（跨上午/下午两波累计）
+# 每日记账（跨上午/下午两波累计 + 当日目标数）
 # --------------------------------------------------------------------------- #
 def load_state() -> dict:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -141,8 +166,9 @@ def load_state() -> dict:
     except (OSError, json.JSONDecodeError):
         state = {}
     if state.get("date") != today:
-        state = {"date": today, "usage": {}}
+        state = {"date": today, "usage": {}, "targets": {}}
     state.setdefault("usage", {})
+    state.setdefault("targets", {})
     return state
 
 
@@ -469,11 +495,11 @@ def resolve_users(client: GraphClient, acc: Account) -> list[str]:
     )
 
 
-def process_account(acc: Account, usage: dict) -> dict:
+def process_account(acc: Account, usage: dict, targets: dict) -> dict:
     result = {
         "name": acc.name, "users": 0, "ok": 0, "fail": 0, "skip": 0,
         "error": "", "sub": "", "expiry": "",
-        "req_run": 0, "req_target": acc.daily_calls, "req_used": 0,
+        "req_run": 0, "req_target": 0, "req_used": 0,
     }
     log.info("—— 开始处理账户 [%s] ——", acc.name)
     try:
@@ -491,22 +517,33 @@ def process_account(acc: Account, usage: dict) -> dict:
         if expiry:
             log.info("[%s] 到期时间: %s", acc.name, expiry)
 
-        # ---- 预算：今天还剩多少就跑多少，保证每天恰好 daily_calls 次 ----
+        # ---- 预算：今日目标（区间随机则每天抽一次并记账），还剩多少跑多少 ----
         used_so_far = int(usage.get(acc.name, 0))
-        if acc.daily_calls > 0:
-            remaining = max(0, acc.daily_calls - used_so_far)
+        if acc.daily_max > 0:
+            target = int(targets.get(acc.name, 0))
+            if not target:
+                target = random.randint(acc.daily_min, acc.daily_max)
+                targets[acc.name] = target
+                log.info(
+                    "[%s] 今日目标抽定：%d 次（范围 %d-%d）",
+                    acc.name, target, acc.daily_min, acc.daily_max,
+                )
+            else:
+                log.info("[%s] 今日目标沿用：%d 次", acc.name, target)
+            result["req_target"] = target
+            remaining = max(0, target - used_so_far)
             if remaining == 0:
                 log.info(
                     "[%s] 今日预算已完成（%d/%d 次），本次不再发起活动请求",
-                    acc.name, used_so_far, acc.daily_calls,
+                    acc.name, used_so_far, target,
                 )
                 result["req_used"] = used_so_far
                 result.update(ok=client.ok, fail=client.fail, skip=client.skip)
                 return result
             run_budget = remaining
             log.info(
-                "[%s] 今日已用 %d 次，剩余 %d 次，本次执行（目标 %d 次/天，约 %d 波）",
-                acc.name, used_so_far, run_budget, acc.daily_calls, acc.runs_per_day,
+                "[%s] 今日已用 %d/%d 次，剩余 %d 次，本次执行（约 %d 波）",
+                acc.name, used_so_far, target, remaining, acc.runs_per_day,
             )
         else:
             run_budget = random.randint(acc.min_calls, acc.max_calls)
@@ -546,7 +583,7 @@ def process_account(acc: Account, usage: dict) -> dict:
             if i < len(selected):
                 time.sleep(random.uniform(0.6, 2.8))
 
-        if acc.daily_calls > 0:
+        if acc.daily_max > 0:
             usage[acc.name] = used_so_far + total_req
             result["req_used"] = usage[acc.name]
         result["req_run"] = total_req
@@ -641,11 +678,12 @@ def main() -> int:
     state = load_state()
     save_state(state)  # 先落盘，确保中途失败也有状态文件
     usage = state["usage"]
+    targets = state["targets"]
 
     started = time.time()
     results = []
     for acc in accounts:
-        results.append(process_account(acc, usage))
+        results.append(process_account(acc, usage, targets))
         save_state(state)  # 每个账户跑完立即记账
     duration = int(time.time() - started)
 
