@@ -1,11 +1,10 @@
 name: E5 KeepAlive
 
 on:
-  workflow_dispatch:          # 支持手动触发
+  workflow_dispatch:          # 手动触发
   schedule:
     - cron: '23 3,15 * * *'   # UTC 3:23 / 15:23，即北京时间 11:23 / 23:23
 
-# 最小权限：workflow 只需要读代码
 permissions:
   contents: read
 
@@ -16,7 +15,7 @@ concurrency:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,20 +24,33 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 随机延迟，错峰执行，避开 GitHub 定时任务拥堵
+      # 随机延迟只在定时任务时生效，手动 Run 跳过
       - name: Random delay
-        run: sleep $((RANDOM % 15))m
+        if: github.event_name == 'schedule'
+        run: sleep $((RANDOM % 5))m
 
       - name: Run keepalive
         env:
+          # ---- E5 账户：多账户用 E5_ACCOUNTS，单账户用下面三件套 ----
+          E5_ACCOUNTS: ${{ secrets.E5_ACCOUNTS }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-          # 可选：只刷指定用户，逗号分隔 UPN，留空则刷租户内前 25 个用户
           TARGET_USERS: ${{ vars.TARGET_USERS }}
+          MIN_CALLS: ${{ vars.MIN_CALLS }}
+          MAX_CALLS: ${{ vars.MAX_CALLS }}
+          ENABLE_WRITES: ${{ vars.ENABLE_WRITES }}
+          # ---- 通知渠道（任选，留空即不启用）----
+          NOTIFY_SERVERCHAN_KEY: ${{ secrets.NOTIFY_SERVERCHAN_KEY }}
+          NOTIFY_TELEGRAM_BOT_TOKEN: ${{ secrets.NOTIFY_TELEGRAM_BOT_TOKEN }}
+          NOTIFY_TELEGRAM_CHAT_ID: ${{ secrets.NOTIFY_TELEGRAM_CHAT_ID }}
+          NOTIFY_SMTP_HOST: ${{ secrets.NOTIFY_SMTP_HOST }}
+          NOTIFY_SMTP_PORT: ${{ secrets.NOTIFY_SMTP_PORT }}
+          NOTIFY_SMTP_USER: ${{ secrets.NOTIFY_SMTP_USER }}
+          NOTIFY_SMTP_PASS: ${{ secrets.NOTIFY_SMTP_PASS }}
+          NOTIFY_SMTP_TO: ${{ secrets.NOTIFY_SMTP_TO }}
         run: python main.py
