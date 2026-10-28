@@ -430,8 +430,12 @@ def main() -> int:
             )
     body = f"运行时间 {now_str}，耗时 {duration}s\n\n" + "\n".join(lines)
 
-    write_step_summary("## " + title + "\n\n" + body + "\n")
-    send_notification(title, body)
+        write_step_summary("## " + title + "\n\n" + body + "\n")
+    notify_on = os.getenv("NOTIFY_ENABLED", "true").strip().lower() != "false"
+    if notify_on:
+        send_notification(title, body)
+    else:
+        log.info("本次为上午场，按设置不推送（每天仅下午场运行后推送）")
 
     log.info("执行完毕: %s", title)
     if os.getenv("GITHUB_ACTIONS") == "true":
