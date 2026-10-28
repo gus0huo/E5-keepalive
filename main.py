@@ -3,6 +3,7 @@
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
+- 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
 - 写操作即建即删；404/507 跳过；429/5xx 退避重试
 """
 
@@ -430,7 +431,8 @@ def main() -> int:
             )
     body = f"运行时间 {now_str}，耗时 {duration}s\n\n" + "\n".join(lines)
 
-        write_step_summary("## " + title + "\n\n" + body + "\n")
+    write_step_summary("## " + title + "\n\n" + body + "\n")
+
     notify_on = os.getenv("NOTIFY_ENABLED", "true").strip().lower() != "false"
     if notify_on:
         send_notification(title, body)
