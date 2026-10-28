@@ -2,10 +2,10 @@
 """
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
-- 预算模型：每账户每天 daily_calls 次请求，按 runs_per_day 和 user 数均摊
+- 预算模型：每账户每天恰好 daily_calls 次请求，跨上午/下午两波累计记账
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
 - 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
-- 推送附带订阅状态与到期时间（手动配置 / 从微软通知邮件推算）
+- 推送附带订阅状态、到期时间、今日请求累计
 - 写操作即建即删；404/507 跳过；429/5xx 退避重试
 """
 
@@ -27,6 +27,7 @@ import requests
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 TOKEN_ENDPOINT = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+STATE_FILE = os.getenv("STATE_FILE", ".e5_state.json")
 
 log = logging.getLogger("e5-keepalive")
 
@@ -42,7 +43,7 @@ class Account:
     client_secret: str
     users: list[str] = field(default_factory=list)  # 空 = 租户内前 25 个用户
     daily_calls: int = 80        # 每天总请求数（设 0 则退回 min/max 随机模式）
-    runs_per_day: int = 2        # 每天跑几次（上午场 + 下午场 = 2）
+    runs_per_day: int = 2        # 每天跑几波（仅用于日志参考）
     min_calls: int = 18          # 旧随机模式用，daily_calls=0 时生效
     max_calls: int = 36
     enable_writes: bool = True
@@ -73,6 +74,10 @@ def load_accounts() -> list[Account]:
             items = json.loads(raw)
         except json.JSONDecodeError as exc:
             log.error("E5_ACCOUNTS 不是合法 JSON：%s", exc)
+            raw_lines = raw.splitlines()
+            for i in range(max(1, exc.lineno - 1), min(len(raw_lines), exc.lineno + 1) + 1):
+                marker = " >>>" if i == exc.lineno else "    "
+                log.error("%s 第 %d 行: %s", marker, i, raw_lines[i - 1])
             sys.exit(2)
         for i, it in enumerate(items, 1):
             accounts.append(
@@ -123,6 +128,30 @@ def load_accounts() -> list[Account]:
         else:
             log.warning("账户 %s 缺少 client_id/client_secret，已跳过", acc.name)
     return valid
+
+
+# --------------------------------------------------------------------------- #
+# 每日记账（跨上午/下午两波累计）
+# --------------------------------------------------------------------------- #
+def load_state() -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if state.get("date") != today:
+        state = {"date": today, "usage": {}}
+    state.setdefault("usage", {})
+    return state
+
+
+def save_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except OSError as exc:
+        log.warning("状态文件写入失败（不影响本次运行）: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +289,9 @@ def _extract_date(text: str, base: datetime | None) -> str:
 
 def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str):
     """返回 (订阅状态摘要, 到期时间线索)。查不到就返回空串。"""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # 1) 订阅状态与席位
     sub = ""
     data = _plain_get(
         tokens,
@@ -275,16 +307,21 @@ def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str
             )
         sub = "；".join(bits)
 
+    # 2) 到期时间：手动配置 > 邮件推算（只认最近 120 天的邮件和未来的日期）
     expiry = ""
     if acc.expiry:
         expiry = f"{acc.expiry}（手动配置）"
     else:
         uid = acc.expiry_scan_user or fallback_uid
         if uid:
+            since = (datetime.now(timezone.utc) - timedelta(days=120)).strftime(
+                "%Y-%m-%dT00:00:00Z"
+            )
             kw = "expires OR expiring OR expiration OR renewal OR renewed OR 续订 OR 续期 OR 到期"
             data = _plain_get(
                 tokens,
-                f"/users/{uid}/messages?$search=\"{kw}\"&$top=10"
+                f"/users/{uid}/messages?$search=\"{kw}\""
+                f"&$filter=receivedDateTime ge {since}&$top=10"
                 "&$select=subject,receivedDateTime,bodyPreview",
             )
             if data:
@@ -300,7 +337,7 @@ def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str
                     except ValueError:
                         pass
                     d = _extract_date(text, base)
-                    if d:
+                    if d and d >= today:  # 过去的日期没有意义，丢弃
                         src = base.strftime("%Y-%m-%d") if base else "未知日期"
                         expiry = f"{d}（据 {src} 的通知邮件推算）"
                         break
@@ -432,10 +469,11 @@ def resolve_users(client: GraphClient, acc: Account) -> list[str]:
     )
 
 
-def process_account(acc: Account) -> dict:
+def process_account(acc: Account, usage: dict) -> dict:
     result = {
         "name": acc.name, "users": 0, "ok": 0, "fail": 0, "skip": 0,
         "error": "", "sub": "", "expiry": "",
+        "req_run": 0, "req_target": acc.daily_calls, "req_used": 0,
     }
     log.info("—— 开始处理账户 [%s] ——", acc.name)
     try:
@@ -453,12 +491,22 @@ def process_account(acc: Account) -> dict:
         if expiry:
             log.info("[%s] 到期时间: %s", acc.name, expiry)
 
-        # ---- 预算：每天 daily_calls ÷ runs_per_day，再按用户均摊 ----
+        # ---- 预算：今天还剩多少就跑多少，保证每天恰好 daily_calls 次 ----
+        used_so_far = int(usage.get(acc.name, 0))
         if acc.daily_calls > 0:
-            run_budget = acc.daily_calls // acc.runs_per_day
+            remaining = max(0, acc.daily_calls - used_so_far)
+            if remaining == 0:
+                log.info(
+                    "[%s] 今日预算已完成（%d/%d 次），本次不再发起活动请求",
+                    acc.name, used_so_far, acc.daily_calls,
+                )
+                result["req_used"] = used_so_far
+                result.update(ok=client.ok, fail=client.fail, skip=client.skip)
+                return result
+            run_budget = remaining
             log.info(
-                "[%s] 预算：每天 %d 次 ÷ %d 波 = 本次 %d 次",
-                acc.name, acc.daily_calls, acc.runs_per_day, run_budget,
+                "[%s] 今日已用 %d 次，剩余 %d 次，本次执行（目标 %d 次/天，约 %d 波）",
+                acc.name, used_so_far, run_budget, acc.daily_calls, acc.runs_per_day,
             )
         else:
             run_budget = random.randint(acc.min_calls, acc.max_calls)
@@ -498,6 +546,10 @@ def process_account(acc: Account) -> dict:
             if i < len(selected):
                 time.sleep(random.uniform(0.6, 2.8))
 
+        if acc.daily_calls > 0:
+            usage[acc.name] = used_so_far + total_req
+            result["req_used"] = usage[acc.name]
+        result["req_run"] = total_req
         result.update(ok=client.ok, fail=client.fail, skip=client.skip)
     except Exception as exc:  # 单个账户出错不影响其他账户
         log.error("[%s] 处理失败：%s", acc.name, exc)
@@ -586,8 +638,15 @@ def main() -> int:
         return 2
     log.info("共 %d 个 E5 账户", len(accounts))
 
+    state = load_state()
+    save_state(state)  # 先落盘，确保中途失败也有状态文件
+    usage = state["usage"]
+
     started = time.time()
-    results = [process_account(acc) for acc in accounts]
+    results = []
+    for acc in accounts:
+        results.append(process_account(acc, usage))
+        save_state(state)  # 每个账户跑完立即记账
     duration = int(time.time() - started)
 
     total_ok = sum(r["ok"] for r in results)
@@ -606,6 +665,13 @@ def main() -> int:
                 f"- **{r['name']}**：用户 {r['users']} 个，成功 {r['ok']}，"
                 f"失败 {r['fail']}，跳过 {r['skip']}"
             )
+            if r["req_target"] > 0:
+                seg += (
+                    f" ｜ 今日请求 {r['req_used']}/{r['req_target']}"
+                    f"（本次 {r['req_run']}）"
+                )
+            else:
+                seg += f" ｜ 本次 {r['req_run']} 次（随机预算模式）"
             seg += f" ｜ {r.get('sub') or '订阅状态未查到'}"
             seg += f" ｜ 到期 {r.get('expiry') or '未查到（配置 expiry 或等微软邮件）'}"
             lines.append(seg)
