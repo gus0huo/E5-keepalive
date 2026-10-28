@@ -1,0 +1,44 @@
+name: E5 KeepAlive
+
+on:
+  workflow_dispatch:          # 支持手动触发
+  schedule:
+    - cron: '23 3,15 * * *'   # UTC 3:23 / 15:23，即北京时间 11:23 / 23:23
+
+# 最小权限：workflow 只需要读代码
+permissions:
+  contents: read
+
+concurrency:
+  group: e5-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 随机延迟，错峰执行，避开 GitHub 定时任务拥堵
+      - name: Random delay
+        run: sleep $((RANDOM % 15))m
+
+      - name: Run keepalive
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          # 可选：只刷指定用户，逗号分隔 UPN，留空则刷租户内前 25 个用户
+          TARGET_USERS: ${{ vars.TARGET_USERS }}
+        run: python main.py
