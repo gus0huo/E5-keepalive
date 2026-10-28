@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
-- OAuth 2.0 client_credentials 流程，凭证仅来自 GitHub Secrets
-- 可通过 TARGET_USERS 变量指定只跑哪几个账号
-- 写操作（草稿/日历/文件夹）创建后立即删除，不留残留
-- 429/5xx 指数退避；404/507（对方账号问题）直接跳过，不重试
+- 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
+- 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
+- 写操作即建即删；404/507 跳过；429/5xx 退避重试
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
+import smtplib
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 
 import requests
 
@@ -27,40 +30,87 @@ log = logging.getLogger("e5-keepalive")
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #
-class Config:
-    def __init__(self) -> None:
-        self.tenant = os.getenv("AZURE_TENANT_ID") or "organizations"
-        self.client_id = os.getenv("AZURE_CLIENT_ID", "")
-        self.client_secret = os.getenv("AZURE_CLIENT_SECRET", "")
-        self.target_users = [
+@dataclass
+class Account:
+    name: str
+    tenant_id: str
+    client_id: str
+    client_secret: str
+    users: list[str] = field(default_factory=list)  # 空 = 租户内前 25 个用户
+    min_calls: int = 18
+    max_calls: int = 36
+    enable_writes: bool = True
+
+
+def _get_int(name: str, default: int) -> int:
+    v = os.getenv(name, "").strip()
+    try:
+        return int(v) if v else default
+    except ValueError:
+        return default
+
+
+def load_accounts() -> list[Account]:
+    """优先读 E5_ACCOUNTS(JSON)；否则退回单账户三件套环境变量。"""
+    raw = os.getenv("E5_ACCOUNTS", "").strip()
+    default_min = _get_int("MIN_CALLS", 18)
+    default_max = _get_int("MAX_CALLS", 36)
+    default_writes = os.getenv("ENABLE_WRITES", "true").strip().lower() != "false"
+
+    accounts: list[Account] = []
+    if raw:
+        try:
+            items = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            log.error("E5_ACCOUNTS 不是合法 JSON：%s", exc)
+            sys.exit(2)
+        for i, it in enumerate(items, 1):
+            accounts.append(
+                Account(
+                    name=it.get("name") or f"账户{i}",
+                    tenant_id=it.get("tenant_id", "") or "organizations",
+                    client_id=it.get("client_id", ""),
+                    client_secret=it.get("client_secret", ""),
+                    users=[u.strip() for u in it.get("users", []) if u.strip()],
+                    min_calls=int(it.get("min_calls", default_min)),
+                    max_calls=int(it.get("max_calls", default_max)),
+                    enable_writes=bool(it.get("enable_writes", default_writes)),
+                )
+            )
+    else:
+        env_users = [
             u.strip() for u in os.getenv("TARGET_USERS", "").split(",") if u.strip()
         ]
-        self.min_calls = int(os.getenv("MIN_CALLS", "18"))
-        self.max_calls = int(os.getenv("MAX_CALLS", "36"))
-        self.enable_writes = os.getenv("ENABLE_WRITES", "true").lower() != "false"
-
-    def validate(self) -> None:
-        missing = [
-            name
-            for name, value in (
-                ("AZURE_CLIENT_ID", self.client_id),
-                ("AZURE_CLIENT_SECRET", self.client_secret),
+        accounts.append(
+            Account(
+                name="默认账户",
+                tenant_id=os.getenv("AZURE_TENANT_ID") or "organizations",
+                client_id=os.getenv("AZURE_CLIENT_ID", ""),
+                client_secret=os.getenv("AZURE_CLIENT_SECRET", ""),
+                users=env_users,
+                min_calls=default_min,
+                max_calls=default_max,
+                enable_writes=default_writes,
             )
-            if not value
-        ]
-        if missing:
-            log.error("缺少 Secrets: %s", ", ".join(missing))
-            sys.exit(2)
-        if self.min_calls > self.max_calls:
-            self.min_calls, self.max_calls = self.max_calls, self.min_calls
+        )
+
+    valid = []
+    for acc in accounts:
+        if acc.client_id and acc.client_secret:
+            if acc.min_calls > acc.max_calls:
+                acc.min_calls, acc.max_calls = acc.max_calls, acc.min_calls
+            valid.append(acc)
+        else:
+            log.warning("账户 %s 缺少 client_id/client_secret，已跳过", acc.name)
+    return valid
 
 
 # --------------------------------------------------------------------------- #
 # Token 管理
 # --------------------------------------------------------------------------- #
 class TokenProvider:
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
+    def __init__(self, acc: Account) -> None:
+        self.acc = acc
         self._token = ""
         self._expires_at = 0.0
 
@@ -70,24 +120,23 @@ class TokenProvider:
     def get(self) -> str:
         if self._token and time.time() < self._expires_at - 120:
             return self._token
-        url = TOKEN_ENDPOINT.format(tenant=self.cfg.tenant)
+        url = TOKEN_ENDPOINT.format(tenant=self.acc.tenant_id)
         resp = requests.post(
             url,
             data={
                 "grant_type": "client_credentials",
-                "client_id": self.cfg.client_id,
-                "client_secret": self.cfg.client_secret,
+                "client_id": self.acc.client_id,
+                "client_secret": self.acc.client_secret,
                 "scope": "https://graph.microsoft.com/.default",
             },
             timeout=30,
         )
         if resp.status_code >= 400:
-            log.error("获取 token 失败: %s %s", resp.status_code, resp.text[:300])
-            sys.exit(3)
+            raise RuntimeError(f"获取 token 失败: {resp.status_code} {resp.text[:200]}")
         payload = resp.json()
         self._token = payload["access_token"]
         self._expires_at = time.time() + float(payload.get("expires_in", 3600))
-        log.info("已获取 access token (有效期 %ss)", payload.get("expires_in"))
+        log.info("[%s] 已获取 access token", self.acc.name)
         return self._token
 
 
@@ -116,7 +165,6 @@ class GraphClient:
                 log.warning("401，刷新 token 后重试")
                 self.tokens.invalidate()
                 continue
-            # 404（未开通 OneDrive）、507（存储已满）重试无意义，直接跳过
             if resp.status_code in (404, 507):
                 self.skip += 1
                 log.info(
@@ -153,7 +201,6 @@ def read_endpoints(uid: str) -> list[tuple[str, str]]:
         ("GET", f"/users/{uid}/mailFolders?$top=5&$select=id,displayName,totalItemCount"),
         ("GET", f"/users/{uid}/events?$top=5&$select=id,subject,start,end"),
         ("GET", f"/users/{uid}/calendarView?startDateTime={start}&endDateTime={end}&$top=5"),
-        ("GET", f"/users/{uid}/contacts?$top=5&$select=id,displayName"),
         ("GET", f"/users/{uid}/drive?$select=id,driveType,quota"),
         ("GET", f"/users/{uid}/drive/root/children?$top=5&$select=id,name,size"),
         ("GET", f"/users/{uid}/photo/$value"),
@@ -164,7 +211,7 @@ def read_endpoints(uid: str) -> list[tuple[str, str]]:
 
 
 # --------------------------------------------------------------------------- #
-# 可回滚的写操作：创建后立即删除
+# 可回滚的写操作
 # --------------------------------------------------------------------------- #
 def write_draft(client: GraphClient, uid: str) -> None:
     tag = datetime.now(timezone.utc).strftime("%m%d%H%M%S")
@@ -216,17 +263,17 @@ def write_folder(client: GraphClient, uid: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 主流程
+# 单账户处理
 # --------------------------------------------------------------------------- #
-def resolve_users(client: GraphClient, cfg: Config) -> list[str]:
-    if cfg.target_users:
+def resolve_users(client: GraphClient, acc: Account) -> list[str]:
+    if acc.users:
         ids = []
-        for upn in cfg.target_users:
+        for upn in acc.users:
             resp = client.call("GET", f"/users/{upn}?$select=id,userPrincipalName")
             if resp is not None and resp.ok:
                 ids.append((resp.json() or {}).get("id", ""))
             else:
-                log.warning("找不到用户 %s，请检查 UPN 是否写对", upn)
+                log.warning("[%s] 找不到用户 %s，请检查 UPN", acc.name, upn)
         return [i for i in ids if i]
     resp = client.call("GET", "/users?$select=id&$top=25")
     if resp is None or not resp.ok:
@@ -234,59 +281,162 @@ def resolve_users(client: GraphClient, cfg: Config) -> list[str]:
     return [u["id"] for u in (resp.json() or {}).get("value", [])]
 
 
+def process_account(acc: Account) -> dict:
+    result = {"name": acc.name, "users": 0, "ok": 0, "fail": 0, "skip": 0, "error": ""}
+    log.info("—— 开始处理账户 [%s] ——", acc.name)
+    try:
+        client = GraphClient(TokenProvider(acc))
+        users = resolve_users(client, acc)
+        if not users:
+            raise RuntimeError("未获取到任何用户（检查权限/管理员同意/UPN）")
+        result["users"] = len(users)
+
+        candidates: list[tuple[str, str]] = []
+        for uid in users:
+            endpoints = read_endpoints(uid)
+            random.shuffle(endpoints)
+            candidates.extend(endpoints[:4])
+            if acc.enable_writes:
+                candidates.append((random.choice(["DRAFT", "EVENT", "FOLDER"]), uid))
+        random.shuffle(candidates)
+
+        budget = random.randint(acc.min_calls, acc.max_calls)
+        selected = candidates[:budget]
+        log.info(
+            "[%s] 计划 %d 个动作（预算 %d，候选 %d）",
+            acc.name, len(selected), budget, len(candidates),
+        )
+
+        for i, job in enumerate(selected, 1):
+            kind = job[0]
+            if kind == "GET":
+                client.call("GET", job[1])
+            elif kind == "DRAFT":
+                write_draft(client, job[1])
+            elif kind == "EVENT":
+                write_event(client, job[1])
+            elif kind == "FOLDER":
+                write_folder(client, job[1])
+            if i < len(selected):
+                time.sleep(random.uniform(0.6, 2.8))
+
+        result.update(ok=client.ok, fail=client.fail, skip=client.skip)
+    except Exception as exc:  # 单个账户出错不影响其他账户
+        log.error("[%s] 处理失败：%s", acc.name, exc)
+        result["error"] = str(exc)
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# 通知
+# --------------------------------------------------------------------------- #
+def send_notification(title: str, body: str) -> None:
+    """body 为 Markdown；各渠道任选，留空即不启用。失败只警告，不影响任务结果。"""
+    plain = body.replace("**", "")
+
+    key = os.getenv("NOTIFY_SERVERCHAN_KEY", "").strip()
+    if key:
+        try:
+            r = requests.post(
+                f"https://sctapi.ftqq.com/{key}.send",
+                data={"title": title, "desp": body},
+                timeout=30,
+            )
+            log.info("Server酱推送: %s", "成功" if r.ok else f"失败 {r.status_code}")
+        except Exception as exc:
+            log.warning("Server酱推送异常: %s", exc)
+
+    tg_token = os.getenv("NOTIFY_TELEGRAM_BOT_TOKEN", "").strip()
+    tg_chat = os.getenv("NOTIFY_TELEGRAM_CHAT_ID", "").strip()
+    if tg_token and tg_chat:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                data={"chat_id": tg_chat, "text": f"{title}\n\n{plain}"},
+                timeout=30,
+            )
+            log.info("Telegram 推送: %s", "成功" if r.ok else f"失败 {r.status_code}")
+        except Exception as exc:
+            log.warning("Telegram 推送异常: %s", exc)
+
+    smtp_host = os.getenv("NOTIFY_SMTP_HOST", "").strip()
+    if smtp_host:
+        try:
+            port = _get_int("NOTIFY_SMTP_PORT", 465)
+            user = os.getenv("NOTIFY_SMTP_USER", "")
+            pwd = os.getenv("NOTIFY_SMTP_PASS", "")
+            to = os.getenv("NOTIFY_SMTP_TO", "").strip() or user
+            sender = os.getenv("NOTIFY_SMTP_FROM", "").strip() or user
+            msg = EmailMessage()
+            msg["Subject"] = title
+            msg["From"] = sender
+            msg["To"] = to
+            msg.set_content(plain)
+            if port == 465:
+                with smtplib.SMTP_SSL(smtp_host, port, timeout=30) as s:
+                    s.login(user, pwd)
+                    s.send_message(msg)
+            else:
+                with smtplib.SMTP(smtp_host, port, timeout=30) as s:
+                    s.starttls()
+                    s.login(user, pwd)
+                    s.send_message(msg)
+            log.info("邮件通知已发送给 %s", to)
+        except Exception as exc:
+            log.warning("邮件通知异常: %s", exc)
+
+
+def write_step_summary(md: str) -> None:
+    path = os.getenv("GITHUB_STEP_SUMMARY", "")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(md + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# 主流程
+# --------------------------------------------------------------------------- #
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-    cfg = Config()
-    cfg.validate()
+    accounts = load_accounts()
+    if not accounts:
+        log.error("没有任何可用账户，请检查 Secrets 配置")
+        return 2
+    log.info("共 %d 个 E5 账户", len(accounts))
 
-    client = GraphClient(TokenProvider(cfg))
-    users = resolve_users(client, cfg)
-    if not users:
-        log.error("未获取到任何用户，请检查 User.Read.All 权限、管理员同意、TARGET_USERS 写法")
-        return 1
-    log.info("目标用户数: %d", len(users))
+    started = time.time()
+    results = [process_account(acc) for acc in accounts]
+    duration = int(time.time() - started)
 
-    # 每个用户：4 个随机只读 + 1 个随机写，再按预算抽样
-    candidates: list[tuple[str, str]] = []
-    for uid in users:
-        endpoints = read_endpoints(uid)
-        random.shuffle(endpoints)
-        candidates.extend(endpoints[:4])
-        if cfg.enable_writes:
-            candidates.append((random.choice(["DRAFT", "EVENT", "FOLDER"]), uid))
-    random.shuffle(candidates)
+    total_ok = sum(r["ok"] for r in results)
+    total_fail = sum(r["fail"] for r in results)
+    total_skip = sum(r["skip"] for r in results)
 
-    budget = random.randint(cfg.min_calls, cfg.max_calls)
-    selected = candidates[:budget]
-    log.info(
-        "本次计划执行 %d 个动作（预算 %d，候选 %d）",
-        len(selected), budget, len(candidates),
-    )
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    title = f"E5 KeepAlive 汇总：成功 {total_ok} / 失败 {total_fail} / 跳过 {total_skip}"
 
-    for i, job in enumerate(selected, 1):
-        kind = job[0]
-        if kind == "GET":
-            client.call("GET", job[1])
-        elif kind == "DRAFT":
-            write_draft(client, job[1])
-        elif kind == "EVENT":
-            write_event(client, job[1])
-        elif kind == "FOLDER":
-            write_folder(client, job[1])
-        if i < len(selected):
-            time.sleep(random.uniform(0.6, 2.8))
+    lines = []
+    for r in results:
+        if r["error"]:
+            lines.append(f"- **{r['name']}**：出错 —— {r['error']}")
+        else:
+            lines.append(
+                f"- **{r['name']}**：用户 {r['users']} 个，成功 {r['ok']}，"
+                f"失败 {r['fail']}，跳过 {r['skip']}"
+            )
+    body = f"运行时间 {now_str}，耗时 {duration}s\n\n" + "\n".join(lines)
 
-    log.info("执行完毕: 成功 %d，失败 %d，跳过 %d", client.ok, client.fail, client.skip)
+    write_step_summary("## " + title + "\n\n" + body + "\n")
+    send_notification(title, body)
+
+    log.info("执行完毕: %s", title)
     if os.getenv("GITHUB_ACTIONS") == "true":
-        print(
-            f"::notice title=E5 KeepAlive::成功 {client.ok} 次，"
-            f"失败 {client.fail} 次，跳过 {client.skip} 次"
-        )
-    return 0 if client.ok > 0 else 1
+        print(f"::notice title=E5 KeepAlive::{title}")
+    return 0 if total_ok > 0 else 1
 
 
 if __name__ == "__main__":
