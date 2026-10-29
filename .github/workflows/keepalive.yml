@@ -3,7 +3,7 @@ name: E5 KeepAlive
 on:
   workflow_dispatch:          # 手动触发（照跑 + 推送，方便测试）
   schedule:
-    # ===== 上午场：北京时间 05:00-07:00（UTC 前一日 21-22 点），8 个候选触发点 =====
+    # ===== 第 1 波：北京 5:00-7:00（8 个候选触发点）=====
     - cron: '3 21 * * *'      # 北京 5:03
     - cron: '18 21 * * *'     # 北京 5:18
     - cron: '33 21 * * *'     # 北京 5:33
@@ -12,15 +12,24 @@ on:
     - cron: '18 22 * * *'     # 北京 6:18
     - cron: '33 22 * * *'     # 北京 6:33
     - cron: '48 22 * * *'     # 北京 6:48
-    # ===== 下午场：北京时间 10:00-12:00（UTC 2-3 点），8 个候选触发点 =====
+    # ===== 第 2 波：北京 9:00-11:00（8 个候选触发点）=====
+    - cron: '3 1 * * *'       # 北京 9:03
+    - cron: '18 1 * * *'      # 北京 9:18
+    - cron: '33 1 * * *'      # 北京 9:33
+    - cron: '48 1 * * *'      # 北京 9:48
     - cron: '3 2 * * *'       # 北京 10:03
     - cron: '18 2 * * *'      # 北京 10:18
     - cron: '33 2 * * *'      # 北京 10:33
     - cron: '48 2 * * *'      # 北京 10:48
-    - cron: '3 3 * * *'       # 北京 11:03
-    - cron: '18 3 * * *'      # 北京 11:18
-    - cron: '33 3 * * *'      # 北京 11:33
-    - cron: '48 3 * * *'      # 北京 11:48
+    # ===== 第 3 波：北京 13:00-15:00（8 个候选触发点，跑完推送）=====
+    - cron: '3 5 * * *'       # 北京 13:03
+    - cron: '18 5 * * *'      # 北京 13:18
+    - cron: '33 5 * * *'      # 北京 13:33
+    - cron: '48 5 * * *'      # 北京 13:48
+    - cron: '3 6 * * *'       # 北京 14:03
+    - cron: '18 6 * * *'      # 北京 14:18
+    - cron: '33 6 * * *'      # 北京 14:33
+    - cron: '48 6 * * *'      # 北京 14:48
 
 permissions:
   contents: read
@@ -32,7 +41,7 @@ concurrency:
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       # 抽签步骤：没中签的触发点在这里几秒退出，不产生实质消耗
       - name: Decide slot
@@ -49,24 +58,32 @@ jobs:
           event = os.environ.get("EVENT", "")
           schedule = os.environ.get("SCHEDULE", "")
           minutes = [3, 18, 33, 48]
-          n_slots = 2 * len(minutes)   # 每窗 2 小时 × 每小时候选数 = 8
+          n_slots = 2 * len(minutes)   # 每窗 2 小时 × 4 = 8 个候选
+
+          # 波次映射：UTC 小时 → (波次名, 是否推送)
+          WINDOWS = {
+              (21, 22): ("w1", "false"),
+              (1, 2):   ("w2", "false"),
+              (5, 6):   ("w3", "true"),   # 末波推送
+          }
 
           if event != "schedule":
-              # 手动触发：照跑 + 推送，方便测试
               run, notify, window = "true", "true", "manual"
           else:
               parts = schedule.split()
               hour, minute = int(parts[1]), int(parts[0])
-              window = "am" if hour in (21, 22) else "pm"
-              base = 21 if window == "am" else 2
+              window, notify, base = "w?", "false", hour
+              for hours, (wname, wnotify) in WINDOWS.items():
+                  if hour in hours:
+                      window, notify = wname, wnotify
+                      base = min(hours)
+                      break
               slot = (hour - base) * len(minutes) + (minutes.index(minute) if minute in minutes else 0)
-              # 用北京日期做种子：同一北京日的两波各自抽签，且防延迟跨天抽出双黄蛋
+              # 用北京日期做种子：同一北京日的各波各自抽签
               date = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
               seed = f"e5-{date}-{window}"
               chosen = int(hashlib.sha256(seed.encode()).hexdigest(), 16) % n_slots
               run = "true" if slot == chosen else "false"
-              # 只有下午场推送
-              notify = "true" if window == "pm" else "false"
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"run={run}\nnotify={notify}\nwindow={window}\n")
@@ -100,7 +117,7 @@ jobs:
       - name: Run keepalive
         if: steps.decide.outputs.run == 'true'
         env:
-          # ---- 运行场次（am=上午场只跑一部分，pm/manual=跑剩余全部）----
+          # ---- 运行场次（决定本次跑多少）----
           RUN_WINDOW: ${{ steps.decide.outputs.window }}
           # ---- E5 账户 ----
           E5_ACCOUNTS: ${{ secrets.E5_ACCOUNTS }}
@@ -108,7 +125,7 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           TARGET_USERS: ${{ vars.TARGET_USERS }}
-          # ---- 预算（每账户每天请求数 / 每天跑几波）----
+          # ---- 预算 ----
           DAILY_CALLS: ${{ vars.DAILY_CALLS }}
           RUNS_PER_DAY: ${{ vars.RUNS_PER_DAY }}
           MIN_CALLS: ${{ vars.MIN_CALLS }}
