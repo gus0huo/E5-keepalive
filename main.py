@@ -3,7 +3,7 @@
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
 - 预算模型：每账户每天恰好 N 次请求；N 可固定(80)或区间随机("70-90"，每天抽一次)
-- 跨上午/下午两波累计记账，账本持久化在 .e5_state.json
+- 上午场随机跑 50%~75%（80 → 40-60），下午场补齐剩余；账本按北京日期累计
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
 - 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
 - 推送附带订阅状态、到期时间、今日请求累计
@@ -63,6 +63,11 @@ class RedactFilter(logging.Filter):
         return True
 
 
+def _today_key() -> str:
+    """北京日期（UTC+8）——账本和过滤统一按北京时间的'天'记账。"""
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #
@@ -75,7 +80,7 @@ class Account:
     users: list[str] = field(default_factory=list)  # 空 = 租户内前 25 个用户
     daily_min: int = 80          # 每天总请求数下限
     daily_max: int = 80          # 每天总请求数上限（= 下限则为固定值；均为 0 退回随机模式）
-    runs_per_day: int = 2        # 每天跑几波（仅用于日志参考）
+    runs_per_day: int = 2        # 每天跑几波（>1 时上午场只跑一部分）
     min_calls: int = 18          # 旧随机模式用，daily 为 0 时生效
     max_calls: int = 36
     enable_writes: bool = True
@@ -186,10 +191,10 @@ def load_accounts() -> list[Account]:
 
 
 # --------------------------------------------------------------------------- #
-# 每日记账（跨上午/下午两波累计 + 当日目标数）
+# 每日记账（按北京日期，跨上午/下午两波累计 + 当日目标数）
 # --------------------------------------------------------------------------- #
 def load_state() -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _today_key()
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             state = json.load(f)
@@ -345,7 +350,7 @@ def _extract_date(text: str, base: datetime | None) -> str:
 
 def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str):
     """返回 (订阅状态摘要, 到期时间线索)。查不到就返回空串。"""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _today_key()
 
     # 1) 订阅状态与席位
     sub = ""
@@ -547,8 +552,9 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
         if expiry:
             log.info("[%s] 到期时间: %s", acc.name, expiry)
 
-        # ---- 预算：今日目标（区间随机则每天抽一次并记账），还剩多少跑多少 ----
+        # ---- 预算：今日目标（区间随机则每天抽一次），上午场只跑一部分 ----
         used_so_far = int(usage.get(acc.name, 0))
+        window = os.getenv("RUN_WINDOW", "").strip().lower()
         if acc.daily_max > 0:
             target = int(targets.get(acc.name, 0))
             if not target:
@@ -570,11 +576,21 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
                 result["req_used"] = used_so_far
                 result.update(ok=client.ok, fail=client.fail, skip=client.skip)
                 return result
-            run_budget = remaining
-            log.info(
-                "[%s] 今日已用 %d/%d 次，剩余 %d 次，本次执行（约 %d 波）",
-                acc.name, used_so_far, target, remaining, acc.runs_per_day,
-            )
+            if used_so_far == 0 and window == "am" and acc.runs_per_day >= 2:
+                # 上午场：随机跑 50%~75%（目标 80 → 40-60），剩余留给下午
+                lo = max(1, target // 2)
+                hi = max(lo, target * 3 // 4)
+                run_budget = random.randint(lo, hi)
+                log.info(
+                    "[%s] 上午场：本次跑 %d 个请求，剩余 %d 个留给下午场（目标 %d）",
+                    acc.name, run_budget, target - run_budget, target,
+                )
+            else:
+                run_budget = remaining
+                log.info(
+                    "[%s] 今日已用 %d/%d 次，剩余 %d 次，本次执行（约 %d 波）",
+                    acc.name, used_so_far, target, remaining, acc.runs_per_day,
+                )
         else:
             run_budget = random.randint(acc.min_calls, acc.max_calls)
             log.info("[%s] 随机预算模式：%d 次", acc.name, run_budget)
