@@ -3,9 +3,9 @@
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
 - 预算模型：每账户每天恰好 N 次请求；N 可固定(80)或区间随机("70-90"，每天抽一次)
-- 上午场随机跑 50%~75%（80 → 40-60），下午场补齐剩余；账本按北京日期累计
+- 三波运行：每波跑剩余的 30%~50%，末波跑完剩余并推送；账本按北京日期累计
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
-- 通过 NOTIFY_ENABLED 控制是否推送（上午场静默，仅下午场推送）
+- 通过 NOTIFY_ENABLED 控制是否推送（前两波静默，仅末波推送）
 - 推送附带订阅状态、到期时间、今日请求累计
 - 日志脱敏：UPN / GUID / 密码自动打码（REDACT_LOGS=false 可关闭）
 - 写操作即建即删；404/507 跳过；429/5xx 退避重试
@@ -64,7 +64,7 @@ class RedactFilter(logging.Filter):
 
 
 def _today_key() -> str:
-    """北京日期（UTC+8）——账本和过滤统一按北京时间的'天'记账。"""
+    """北京日期（UTC+8）——账本统一按北京时间的'天'记账。"""
     return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
 
 
@@ -80,7 +80,7 @@ class Account:
     users: list[str] = field(default_factory=list)  # 空 = 租户内前 25 个用户
     daily_min: int = 80          # 每天总请求数下限
     daily_max: int = 80          # 每天总请求数上限（= 下限则为固定值；均为 0 退回随机模式）
-    runs_per_day: int = 2        # 每天跑几波（>1 时上午场只跑一部分）
+    runs_per_day: int = 3        # 每天跑几波（仅用于日志参考）
     min_calls: int = 18          # 旧随机模式用，daily 为 0 时生效
     max_calls: int = 36
     enable_writes: bool = True
@@ -120,7 +120,7 @@ def load_accounts() -> list[Account]:
     """优先读 E5_ACCOUNTS(JSON)；否则退回单账户三件套环境变量。"""
     raw = os.getenv("E5_ACCOUNTS", "").strip()
     env_calls = _parse_calls(os.getenv("DAILY_CALLS", "").strip() or None)
-    env_runs = _get_int("RUNS_PER_DAY", 2)
+    env_runs = _get_int("RUNS_PER_DAY", 3)
     default_min = _get_int("MIN_CALLS", 18)
     default_max = _get_int("MAX_CALLS", 36)
     default_writes = os.getenv("ENABLE_WRITES", "true").strip().lower() != "false"
@@ -191,7 +191,7 @@ def load_accounts() -> list[Account]:
 
 
 # --------------------------------------------------------------------------- #
-# 每日记账（按北京日期，跨上午/下午两波累计 + 当日目标数）
+# 每日记账（按北京日期，跨波次累计 + 当日目标数）
 # --------------------------------------------------------------------------- #
 def load_state() -> dict:
     today = _today_key()
@@ -552,9 +552,10 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
         if expiry:
             log.info("[%s] 到期时间: %s", acc.name, expiry)
 
-        # ---- 预算：今日目标（区间随机则每天抽一次），上午场只跑一部分 ----
+        # ---- 预算：非末波跑剩余的 30%~50%，末波跑完剩余 ----
         used_so_far = int(usage.get(acc.name, 0))
         window = os.getenv("RUN_WINDOW", "").strip().lower()
+        is_last_wave = window in ("w3", "pm", "manual")  # 末波 / 手动 = 跑完剩余
         if acc.daily_max > 0:
             target = int(targets.get(acc.name, 0))
             if not target:
@@ -576,20 +577,20 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
                 result["req_used"] = used_so_far
                 result.update(ok=client.ok, fail=client.fail, skip=client.skip)
                 return result
-            if used_so_far == 0 and window == "am" and acc.runs_per_day >= 2:
-                # 上午场：随机跑 50%~75%（目标 80 → 40-60），剩余留给下午
-                lo = max(1, target // 2)
-                hi = max(lo, target * 3 // 4)
-                run_budget = random.randint(lo, hi)
-                log.info(
-                    "[%s] 上午场：本次跑 %d 个请求，剩余 %d 个留给下午场（目标 %d）",
-                    acc.name, run_budget, target - run_budget, target,
-                )
-            else:
+            if is_last_wave:
                 run_budget = remaining
                 log.info(
-                    "[%s] 今日已用 %d/%d 次，剩余 %d 次，本次执行（约 %d 波）",
-                    acc.name, used_so_far, target, remaining, acc.runs_per_day,
+                    "[%s] 末波：跑完剩余 %d 次（目标 %d，已用 %d）",
+                    acc.name, remaining, target, used_so_far,
+                )
+            else:
+                lo = max(1, remaining * 3 // 10)
+                hi = max(lo, remaining * 5 // 10)
+                run_budget = random.randint(lo, hi)
+                log.info(
+                    "[%s] 本次跑 %d 个请求，剩余 %d 个留给后续波次（目标 %d，已用 %d）",
+                    acc.name, run_budget, target - used_so_far - run_budget,
+                    target, used_so_far,
                 )
         else:
             run_budget = random.randint(acc.min_calls, acc.max_calls)
@@ -772,7 +773,7 @@ def main() -> int:
     if notify_on:
         send_notification(title, body)
     else:
-        log.info("本次为上午场，按设置不推送（每天仅下午场运行后推送）")
+        log.info("本次为前两波，按设置不推送（每天仅末波运行后推送）")
 
     log.info("执行完毕: %s", title)
     if os.getenv("GITHUB_ACTIONS") == "true":
