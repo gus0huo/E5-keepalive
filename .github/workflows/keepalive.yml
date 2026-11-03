@@ -1,43 +1,22 @@
 # ============================================================
 # 此文件由 tools/build_keepalive.py 自动生成，请勿直接修改！
 # 要调整运行时间/波次/每天总量：改仓库根目录的 schedule.yml，
-# 然后运行 Actions -> Rebuild Schedule
-# 生成时间：2026-11-03 04:49 UTC / 触发点批次：2026-W45 / 每天总量：70-90
+# 然后运行 Actions -> Rebuild Schedule（每晚 20:07 也会自动重抽时刻）
+# 生成时间：2026-11-03 09:25 UTC / 适用日期：2026-11-04 / 每天总量：70-90
 # ============================================================
 name: E5 KeepAlive
 
 on:
   workflow_dispatch:          # 手动触发（照跑 + 推送，方便测试）
   schedule:
-    # ==== w1：北京时间 05:00-07:00（每天总量 70-90，本波 30-50，2026-W45 抽点）====
-    - cron: '49 21 * * *'   # w1 触发点 1
-    - cron: '56 21 * * *'   # w1 触发点 2
-    - cron: '57 21 * * *'   # w1 触发点 3
-    - cron: '2 22 * * *'   # w1 触发点 4
-    - cron: '14 22 * * *'   # w1 触发点 5
-    - cron: '30 22 * * *'   # w1 触发点 6
-    - cron: '40 22 * * *'   # w1 触发点 7
-    - cron: '54 22 * * *'   # w1 触发点 8
+    # ==== w1：北京时间 05:00-07:00 → 抽定时刻 06:04（2026-11-04）｜每天总量 70-90，本波 30-50 ====
+    - cron: '4 22 * * *'
 
-    # ==== w2：北京时间 07:00-09:00（每天总量 70-90，本波 30-50，2026-W45 抽点）====
-    - cron: '25 0 * * *'   # w2 触发点 1
-    - cron: '36 0 * * *'   # w2 触发点 2
-    - cron: '37 0 * * *'   # w2 触发点 3
-    - cron: '38 0 * * *'   # w2 触发点 4
-    - cron: '55 0 * * *'   # w2 触发点 5
-    - cron: '26 23 * * *'   # w2 触发点 6
-    - cron: '33 23 * * *'   # w2 触发点 7
-    - cron: '45 23 * * *'   # w2 触发点 8
+    # ==== w2：北京时间 07:00-09:00 → 抽定时刻 08:15（2026-11-04）｜每天总量 70-90，本波 30-50 ====
+    - cron: '15 0 * * *'
 
-    # ==== w3：北京时间 09:00-11:00（每天总量 70-90，本波 100%跑完剩余，2026-W45 抽点）====
-    - cron: '19 1 * * *'   # w3 触发点 1
-    - cron: '23 1 * * *'   # w3 触发点 2
-    - cron: '24 1 * * *'   # w3 触发点 3
-    - cron: '45 1 * * *'   # w3 触发点 4
-    - cron: '4 2 * * *'   # w3 触发点 5
-    - cron: '9 2 * * *'   # w3 触发点 6
-    - cron: '11 2 * * *'   # w3 触发点 7
-    - cron: '14 2 * * *'   # w3 触发点 8
+    # ==== w3：北京时间 09:00-11:00 → 抽定时刻 09:35（2026-11-04）｜每天总量 70-90，本波 100%跑完剩余 ====
+    - cron: '35 1 * * *'
 
 permissions:
   contents: read
@@ -51,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      # 抽签步骤：没中签的触发点在这里几秒退出，不产生实质消耗
+      # 场次识别：把触发时刻映射为波次参数（精确时刻模式，无抽签）
       - name: Decide slot
         id: decide
         env:
@@ -59,38 +38,14 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           python3 - <<'PYEOF'
-          import hashlib
           import os
-          from datetime import datetime, timedelta, timezone
 
-          # (UTC小时, UTC分钟) -> (波次名, 槽位号, 是否末波, 是否推送, 本波百分比)。由生成器注入
+          # (UTC小时, UTC分钟) -> (波次名, 是否末波, 是否推送, 本波百分比)。由生成器注入
           SLOTS = {
-            (0, 25): ('w2', 0, 'false', 'false', '30-50'),
-            (0, 36): ('w2', 1, 'false', 'false', '30-50'),
-            (0, 37): ('w2', 2, 'false', 'false', '30-50'),
-            (0, 38): ('w2', 3, 'false', 'false', '30-50'),
-            (0, 55): ('w2', 4, 'false', 'false', '30-50'),
-            (1, 19): ('w3', 0, 'true', 'true', 'rest'),
-            (1, 23): ('w3', 1, 'true', 'true', 'rest'),
-            (1, 24): ('w3', 2, 'true', 'true', 'rest'),
-            (1, 45): ('w3', 3, 'true', 'true', 'rest'),
-            (2, 4): ('w3', 4, 'true', 'true', 'rest'),
-            (2, 9): ('w3', 5, 'true', 'true', 'rest'),
-            (2, 11): ('w3', 6, 'true', 'true', 'rest'),
-            (2, 14): ('w3', 7, 'true', 'true', 'rest'),
-            (21, 49): ('w1', 0, 'false', 'false', '30-50'),
-            (21, 56): ('w1', 1, 'false', 'false', '30-50'),
-            (21, 57): ('w1', 2, 'false', 'false', '30-50'),
-            (22, 2): ('w1', 3, 'false', 'false', '30-50'),
-            (22, 14): ('w1', 4, 'false', 'false', '30-50'),
-            (22, 30): ('w1', 5, 'false', 'false', '30-50'),
-            (22, 40): ('w1', 6, 'false', 'false', '30-50'),
-            (22, 54): ('w1', 7, 'false', 'false', '30-50'),
-            (23, 26): ('w2', 5, 'false', 'false', '30-50'),
-            (23, 33): ('w2', 6, 'false', 'false', '30-50'),
-            (23, 45): ('w2', 7, 'false', 'false', '30-50'),
+            (0, 15): ('w2', 'false', 'false', '30-50'),
+            (1, 35): ('w3', 'true', 'true', 'rest'),
+            (22, 4): ('w1', 'false', 'false', '30-50'),
           }
-          N_POINTS = 8
 
           event = os.environ.get("EVENT", "")
           schedule = os.environ.get("SCHEDULE", "")
@@ -101,11 +56,9 @@ jobs:
           else:
               parts = schedule.split()
               key = (int(parts[1]), int(parts[0]))   # cron 格式：分 时 * * *
-              wave, slot, is_last, notify, pct = SLOTS.get(key, ("unknown", -1, "true", "false", "rest"))
-              date = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
-              chosen = int(hashlib.sha256(f"pick|{date}|{wave}".encode()).hexdigest(), 16) % N_POINTS
-              run = "true" if slot == chosen else "false"
-              print(f"schedule={schedule!r} wave={wave} slot={slot} chosen={chosen} pct={pct} -> run={run}")
+              window, is_last, notify, pct = SLOTS.get(key, ("w?", "false", "false", "30-50"))
+              run = "true"
+              print(f"schedule={schedule!r} -> wave={window} is_last={is_last} pct={pct}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"run={run}\nnotify={notify}\nwindow={window}\nis_last={is_last}\npercent={pct}\n")
