@@ -4,10 +4,10 @@ E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
 - 预算模型：每账户每天恰好 N 次请求；N 来自 schedule.yml 的 plan_min~plan_max，每天抽一次
 - 波次由 schedule.yml 定义：每波执行当天总量的指定百分比，末波跑完剩余并推送
-- 账本按北京日期跨波次累计，持久化在 .e5_state.json；崩溃时已执行次数也会记账
+- 账本按北京日期跨波次累计（含每波运行流水），持久化在 .e5_state.json；崩溃时已执行次数也会记账
+- 推送为表格版：账户 / 用户 / 今日请求 / 各波 时间(请求数) / 到期时间
 - 网络超时/连接异常自动退避重试，不影响同账户后续动作
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
-- 推送附带订阅状态、到期时间、今日请求累计
 - 日志脱敏：UPN / GUID / 密码自动打码（REDACT_LOGS=false 可关闭）
 - 写操作即建即删；404/507 跳过；429/5xx 退避重试
 """
@@ -64,9 +64,13 @@ class RedactFilter(logging.Filter):
         return True
 
 
+def _beijing_now():
+    return datetime.now(timezone.utc) + timedelta(hours=8)
+
+
 def _today_key() -> str:
     """北京日期（UTC+8）——账本统一按北京时间的'天'记账。"""
-    return (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+    return _beijing_now().strftime("%Y-%m-%d")
 
 
 # --------------------------------------------------------------------------- #
@@ -197,7 +201,7 @@ def load_accounts() -> list[Account]:
 
 
 # --------------------------------------------------------------------------- #
-# 每日记账（按北京日期，跨波次累计 + 当日目标数）
+# 每日记账（按北京日期：当日目标 + 累计用量 + 每波运行流水）
 # --------------------------------------------------------------------------- #
 def load_state() -> dict:
     today = _today_key()
@@ -207,9 +211,10 @@ def load_state() -> dict:
     except (OSError, json.JSONDecodeError):
         state = {}
     if state.get("date") != today:
-        state = {"date": today, "usage": {}, "targets": {}}
+        state = {"date": today, "usage": {}, "targets": {}, "history": {}}
     state.setdefault("usage", {})
     state.setdefault("targets", {})
+    state.setdefault("history", {})
     return state
 
 
@@ -219,6 +224,14 @@ def save_state(state: dict) -> None:
             json.dump(state, f, ensure_ascii=False)
     except OSError as exc:
         log.warning("状态文件写入失败（不影响本次运行）: %s", exc)
+
+
+def record_history(state: dict, name: str, req_count: int) -> None:
+    """记录一波运行：时间(北京 HH:MM) + 请求数，最多保留最近 12 条。"""
+    hist = state["history"].setdefault(name, [])
+    hist.append({"t": _beijing_now().strftime("%H:%M"), "n": int(req_count)})
+    if len(hist) > 12:
+        del hist[:-12]
 
 
 # --------------------------------------------------------------------------- #
@@ -686,11 +699,39 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# 表格渲染（推送 / Summary 用 Markdown 表格，Telegram/邮件用纯文本行）
+# --------------------------------------------------------------------------- #
+def build_table(results: list[dict], history: dict) -> tuple[str, str]:
+    wave_n = max((len(history.get(r["name"], [])) for r in results), default=0)
+    wave_n = min(max(wave_n, 1), 6)   # 最多 6 列，防止手动测试太多把表撑爆
+
+    headers = ["账户", "用户", "今日请求"] + [f"第{i}次" for i in range(1, wave_n + 1)] + ["到期时间"]
+    md_lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
+    plain_lines = []
+
+    for r in results:
+        hist = history.get(r["name"], [])
+        cells = []
+        for i in range(wave_n):
+            if i < len(hist):
+                cells.append(f"{hist[i]['t']}（{hist[i]['n']}）")
+            else:
+                cells.append("—")
+        used = f"{r['req_used']}/{r['req_target']}" if r["req_target"] > 0 else f"{r['req_run']} 次"
+        row = [r["name"], str(r["users"]), used] + cells + [r.get("expiry") or "未查到"]
+        md_lines.append("| " + " | ".join(row) + " |")
+        plain_lines.append(" ｜ ".join(row))
+
+    return "\n".join(md_lines), "\n".join(plain_lines)
+
+
+# --------------------------------------------------------------------------- #
 # 通知
 # --------------------------------------------------------------------------- #
-def send_notification(title: str, body: str) -> None:
-    """body 为 Markdown；各渠道任选，留空即不启用。失败只警告，不影响任务结果。"""
-    plain = body.replace("**", "")
+def send_notification(title: str, body: str, plain: str | None = None) -> None:
+    """body 为 Markdown（表格），plain 为纯文本版。各渠道任选，留空即不启用。"""
+    if plain is None:
+        plain = body.replace("**", "")
 
     key = os.getenv("NOTIFY_SERVERCHAN_KEY", "").strip()
     if key:
@@ -729,7 +770,7 @@ def send_notification(title: str, body: str) -> None:
             msg["Subject"] = title
             msg["From"] = sender
             msg["To"] = to
-            msg.set_content(plain)
+            msg.set_content(f"{title}\n\n{plain}")
             if port == 465:
                 with smtplib.SMTP_SSL(smtp_host, port, timeout=30) as s:
                     s.login(user, pwd)
@@ -778,8 +819,10 @@ def main() -> int:
     started = time.time()
     results = []
     for acc in accounts:
-        results.append(process_account(acc, usage, targets))
-        save_state(state)  # 每个账户跑完立即记账
+        r = process_account(acc, usage, targets)
+        results.append(r)
+        record_history(state, acc.name, r["req_run"])   # 记录本波运行流水
+        save_state(state)                               # 每个账户跑完立即记账
     duration = int(time.time() - started)
 
     total_ok = sum(r["ok"] for r in results)
@@ -789,36 +832,41 @@ def main() -> int:
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     title = f"E5 KeepAlive 汇总：成功 {total_ok} / 失败 {total_fail} / 跳过 {total_skip}"
 
-    lines = []
+    # ---- 表格 + 备注 ----
+    md_table, plain_table = build_table(results, state["history"])
+
+    notes_md, notes_plain = [], []
     for r in results:
         if r["error"]:
-            seg = f"- **{r['name']}**：出错 —— {r['error']}"
+            msg = f"{r['name']} 出错：{r['error']}"
             if r["req_run"]:
-                seg += f"（中断前已执行 {r['req_run']} 次，已记账）"
-            lines.append(seg)
+                msg += f"（中断前已执行 {r['req_run']} 次，已记账）"
+            notes_md.append(f"- {msg}")
+            notes_plain.append(f"- {msg}")
         else:
-            seg = (
-                f"- **{r['name']}**：用户 {r['users']} 个，成功 {r['ok']}，"
-                f"失败 {r['fail']}，跳过 {r['skip']}"
-            )
-            if r["req_target"] > 0:
-                seg += (
-                    f" ｜ 今日请求 {r['req_used']}/{r['req_target']}"
-                    f"（本次 {r['req_run']}）"
-                )
-            else:
-                seg += f" ｜ 本次 {r['req_run']} 次（不计入每日预算）"
-            seg += f" ｜ {r.get('sub') or '订阅状态未查到'}"
-            seg += f" ｜ 到期 {r.get('expiry') or '未查到（配置 expiry 或等微软邮件）'}"
-            lines.append(seg)
-    body = f"运行时间 {now_str}，耗时 {duration}s\n\n" + "\n".join(lines)
-    body = redact_text(body)
+            bits = []
+            if r["fail"] or r["skip"]:
+                bits.append(f"失败 {r['fail']}，跳过 {r['skip']}")
+            if r.get("sub"):
+                bits.append(r["sub"])
+            if bits:
+                notes_md.append(f"- {r['name']}：" + " ｜ ".join(bits))
+                notes_plain.append(f"- {r['name']}：" + " ｜ ".join(bits))
 
-    write_step_summary("## " + title + "\n\n" + body + "\n")
+    intro = f"运行时间 {now_str}，耗时 {duration}s"
+    body_md = intro + "\n\n" + md_table
+    body_plain = intro + "\n\n" + plain_table
+    if notes_md:
+        body_md += "\n\n" + "\n".join(notes_md)
+        body_plain += "\n\n" + "\n".join(notes_plain)
+    body_md = redact_text(body_md)
+    body_plain = redact_text(body_plain)
+
+    write_step_summary("## " + title + "\n\n" + body_md + "\n")
 
     notify_on = os.getenv("NOTIFY_ENABLED", "true").strip().lower() != "false"
     if notify_on:
-        send_notification(title, body)
+        send_notification(title, body_md, body_plain)
     else:
         log.info("本次为非推送波次，按设置不推送（每天仅末波运行后推送）")
 
