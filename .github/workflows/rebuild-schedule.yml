@@ -1,0 +1,40 @@
+name: Rebuild Schedule
+
+on:
+  workflow_dispatch:          # 手动：改完 schedule.yml 后点一下
+  schedule:
+    - cron: '17 0 * * 1'      # 每周一 UTC 0:17（北京 8:17）自动换一批新触发点
+
+permissions:
+  contents: write             # 需要提交生成的 keepalive.yml
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 生成 keepalive.yml
+        run: python tools/build_keepalive.py
+
+      - name: 提交变更
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/keepalive.yml
+          if git diff --cached --quiet; then
+            echo "触发点无变化，跳过提交"
+          else
+            git commit -m "chore: 自动更新运行触发点"
+            git push
+          fi
