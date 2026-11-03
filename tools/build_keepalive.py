@@ -2,9 +2,10 @@
 """
 tools/build_keepalive.py —— 读取 schedule.yml，生成 .github/workflows/keepalive.yml
 
-- 时间段按北京时间填写，脚本自动换算 UTC
-- 每个时间段随机抽取 candidate_points 个触发点，按 rotate 周期更换
-- 每天总量区间（plan_min~plan_max）写入生成的 workflow，由 main.py 每天抽随机数执行
+纯 exact 模式：
+- 每个时间段（北京时间）为次日抽取 1 个精确随机时刻，换算 UTC 写入 cron
+- 随机种子 = 目标日期 + 波次：同一天重复运行结果相同（幂等），每天各不相同
+- 每晚由 Rebuild Schedule 调用一次并提交；生成失败时旧时刻继续生效（降级不中断）
 - 一般不需要手动运行：Actions -> Rebuild Schedule 会自动调用本脚本
 """
 
@@ -83,17 +84,14 @@ def load_config():
     except yaml.YAMLError as exc:
         die(f"{CONFIG_PATH} 不是合法 YAML：{exc}")
 
+    # exact 模式已移除的旧字段，出现时提示并忽略
+    for legacy in ("candidate_points", "rotate"):
+        if legacy in cfg:
+            print(f"[提示] {legacy} 已在精确时刻模式中移除，此字段被忽略")
+
     waves_raw = cfg.get("waves") or []
     if not waves_raw:
         die("waves 为空，至少配置一个时间段")
-
-    n_points = int(cfg.get("candidate_points", 8))
-    if not 1 <= n_points <= 24:
-        die("candidate_points 需在 1~24 之间")
-
-    rotate = str(cfg.get("rotate", "weekly")).lower()
-    if rotate not in ("daily", "weekly", "monthly", "fixed"):
-        die("rotate 只能是 daily / weekly / monthly / fixed")
 
     parsed = []
     plan_ref = None
@@ -149,39 +147,29 @@ def load_config():
         print(f"[提示] 前几波 percent 上限之和为 {sum_hi}%，超出部分会被自动压缩，不影响每天恰好完成总计划")
 
     plan_env = f"{plan_ref[0]}-{plan_ref[1]}" if plan_ref[0] != plan_ref[1] else str(plan_ref[0])
-    return parsed, n_points, rotate, plan_env
+    return parsed, plan_env
 
 
-def rotation_period(rotate: str) -> str:
-    """触发点的更换周期标识（北京时间）。"""
+def target_run_date() -> str:
+    """随机时刻所属的日期：北京时间 12 点前运行算今天，12 点后算明天。
+    生成器固定每晚 20:07 运行 → 生成次日的时刻；同日重复运行幂等。"""
     now = datetime.now(timezone.utc) + timedelta(hours=8)
-    if rotate == "daily":
-        return now.strftime("%Y-%m-%d")
-    if rotate == "monthly":
-        return now.strftime("%Y-%m")
-    if rotate == "fixed":
-        return "fixed"
-    iso_year, iso_week, _ = now.isocalendar()
-    return f"{iso_year}-W{iso_week:02d}"
+    day = now.date() if now.hour < 12 else now.date() + timedelta(days=1)
+    return day.strftime("%Y-%m-%d")
 
 
-def pick_points(wave: dict, n_points: int, period: str, used: set) -> list[tuple[int, int]]:
-    """在时间段内随机抽触发点（北京时间），换算为 UTC (小时, 分钟) 列表。"""
+def pick_exact_point(wave: dict, period: str, used: set) -> tuple[int, int]:
+    """在时间段内抽 1 个精确随机时刻（北京时间），换算为 UTC (小时, 分钟)。"""
     duration = (wave["end"] - wave["start"]) % 1440
-    count = min(n_points, duration)
-    rng = random.Random(f"points|{period}|{wave['index']}|{wave['label']}")
-    offsets = sorted(rng.sample(range(duration), count))
-
-    points: list[tuple[int, int]] = []
-    for off in offsets:
-        utc_minutes = (wave["start"] + off - 8 * 60) % 1440   # 北京时间 - 8h = UTC
+    rng = random.Random(f"exact|{period}|{wave['index']}|{wave['label']}")
+    offset = rng.randrange(duration)
+    utc_minutes = (wave["start"] + offset - 8 * 60) % 1440   # 北京时间 - 8h = UTC
+    key = (utc_minutes // 60, utc_minutes % 60)
+    while key in used:            # 跨波次撞点时顺延 1 分钟
+        utc_minutes = (utc_minutes + 1) % 1440
         key = (utc_minutes // 60, utc_minutes % 60)
-        while key in used:            # 跨波次撞点时顺延 1 分钟
-            utc_minutes = (utc_minutes + 1) % 1440
-            key = (utc_minutes // 60, utc_minutes % 60)
-        used.add(key)
-        points.append(key)
-    return sorted(points)
+    used.add(key)
+    return key
 
 
 # --------------------------------------------------------------------------- #
@@ -190,8 +178,8 @@ def pick_points(wave: dict, n_points: int, period: str, used: set) -> list[tuple
 TEMPLATE = """# ============================================================
 # 此文件由 tools/build_keepalive.py 自动生成，请勿直接修改！
 # 要调整运行时间/波次/每天总量：改仓库根目录的 schedule.yml，
-# 然后运行 Actions -> Rebuild Schedule
-# 生成时间：@@GENERATED_AT@@ / 触发点批次：@@PERIOD@@ / 每天总量：@@PLAN@@
+# 然后运行 Actions -> Rebuild Schedule（每晚 20:07 也会自动重抽时刻）
+# 生成时间：@@GENERATED_AT@@ / 适用日期：@@PERIOD@@ / 每天总量：@@PLAN@@
 # ============================================================
 name: E5 KeepAlive
 
@@ -212,7 +200,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      # 抽签步骤：没中签的触发点在这里几秒退出，不产生实质消耗
+      # 场次识别：把触发时刻映射为波次参数（精确时刻模式，无抽签）
       - name: Decide slot
         id: decide
         env:
@@ -220,13 +208,10 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           python3 - <<'PYEOF'
-          import hashlib
           import os
-          from datetime import datetime, timedelta, timezone
 
-          # (UTC小时, UTC分钟) -> (波次名, 槽位号, 是否末波, 是否推送, 本波百分比)。由生成器注入
+          # (UTC小时, UTC分钟) -> (波次名, 是否末波, 是否推送, 本波百分比)。由生成器注入
           SLOTS = @@SLOTS@@
-          N_POINTS = @@N_POINTS@@
 
           event = os.environ.get("EVENT", "")
           schedule = os.environ.get("SCHEDULE", "")
@@ -237,11 +222,9 @@ jobs:
           else:
               parts = schedule.split()
               key = (int(parts[1]), int(parts[0]))   # cron 格式：分 时 * * *
-              wave, slot, is_last, notify, pct = SLOTS.get(key, ("unknown", -1, "true", "false", "rest"))
-              date = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
-              chosen = int(hashlib.sha256(f"pick|{date}|{wave}".encode()).hexdigest(), 16) % N_POINTS
-              run = "true" if slot == chosen else "false"
-              print(f"schedule={schedule!r} wave={wave} slot={slot} chosen={chosen} pct={pct} -> run={run}")
+              window, is_last, notify, pct = SLOTS.get(key, ("w?", "false", "false", "30-50"))
+              run = "true"
+              print(f"schedule={schedule!r} -> wave={window} is_last={is_last} pct={pct}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"run={run}\\nnotify={notify}\\nwindow={window}\\nis_last={is_last}\\npercent={pct}\\n")
@@ -311,8 +294,8 @@ jobs:
 
 
 def build() -> None:
-    waves, n_points, rotate, plan_env = load_config()
-    period = rotation_period(rotate)
+    waves, plan_env = load_config()
+    period = target_run_date()
 
     used: set = set()
     slots: dict = {}
@@ -320,14 +303,15 @@ def build() -> None:
     for i, wave in enumerate(waves):
         name = f"w{i + 1}"
         is_last = "true" if i == len(waves) - 1 else "false"
-        points = pick_points(wave, n_points, period, used)
+        h, m = pick_exact_point(wave, period, used)
+        slots[(h, m)] = (name, is_last, wave["notify"], wave["percent"])
+        bj = (h * 60 + m + 480) % 1440
+        pct_label = wave["percent"] if wave["percent"] != "rest" else "100%跑完剩余"
         schedule_lines.append(
-            f"    # ==== {name}：北京时间 {wave['label']}（每天总量 {plan_env}，"
-            f"本波 {wave['percent'] if wave['percent'] != 'rest' else '100%跑完剩余'}，{period} 抽点）===="
+            f"    # ==== {name}：北京时间 {wave['label']} → 抽定时刻 "
+            f"{bj // 60:02d}:{bj % 60:02d}（{period}）｜每天总量 {plan_env}，本波 {pct_label} ===="
         )
-        for slot, (h, m) in enumerate(points):
-            slots[(h, m)] = (name, slot, is_last, wave["notify"], wave["percent"])
-            schedule_lines.append(f"    - cron: '{m} {h} * * *'   # {name} 触发点 {slot + 1}")
+        schedule_lines.append(f"    - cron: '{m} {h} * * *'")
         schedule_lines.append("")
 
     slots_lines = ",\n".join(f"            {key}: {slots[key]!r}" for key in sorted(slots))
@@ -338,11 +322,10 @@ def build() -> None:
         .replace("@@PLAN@@", plan_env)
         .replace("@@SCHEDULE@@", "\n".join(schedule_lines).rstrip())
         .replace("@@SLOTS@@", "{\n" + slots_lines + ",\n          }")
-        .replace("@@N_POINTS@@", str(n_points))
     )
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(content)
-    print(f"已生成 {OUTPUT_PATH}（批次 {period}，每天总量 {plan_env}，共 {len(slots)} 个触发点）")
+    print(f"已生成 {OUTPUT_PATH}（适用日期 {period}，每天总量 {plan_env}，{len(slots)} 个精确时刻）")
 
 
 if __name__ == "__main__":
