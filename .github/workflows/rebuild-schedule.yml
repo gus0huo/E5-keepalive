@@ -3,10 +3,10 @@ name: Rebuild Schedule
 on:
   workflow_dispatch:          # 手动：改完 schedule.yml 后点一下
   schedule:
-    - cron: '17 0 * * 1'      # 每周一 UTC 0:17（北京 8:17）自动换一批新触发点
+    - cron: '7 12 * * *'      # 每天 UTC 12:07（北京 20:07）重抽次日的随机时刻
 
 permissions:
-  contents: read              # 推送走 PAT（见下），GITHUB_TOKEN 只读即可
+  contents: read              # 推送走 PAT（GITHUB_TOKEN 被禁止改 workflow 文件）
 
 jobs:
   rebuild:
@@ -39,6 +39,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "触发点无变化，跳过提交"
           else
-            git commit -m "chore: 自动更新运行触发点"
+            git commit -m "chore: 更新次日随机运行时刻"
             git push
           fi
