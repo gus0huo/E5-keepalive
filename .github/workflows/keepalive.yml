@@ -1,20 +1,173 @@
-# 初始占位版 —— 正式调度由 tools/build_keepalive.py 生成
-# 部署后请运行 Actions -> Rebuild Schedule -> Run workflow
+# ============================================================
+# 此文件由 tools/build_keepalive.py 自动生成，请勿直接修改！
+# 要调整运行时间/波次/每天总量：改仓库根目录的 schedule.yml，
+# 然后运行 Actions -> Rebuild Schedule
+# 生成时间：2026-11-03 04:49 UTC / 触发点批次：2026-W45 / 每天总量：70-90
+# ============================================================
 name: E5 KeepAlive
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # 手动触发（照跑 + 推送，方便测试）
+  schedule:
+    # ==== w1：北京时间 05:00-07:00（每天总量 70-90，本波 30-50，2026-W45 抽点）====
+    - cron: '49 21 * * *'   # w1 触发点 1
+    - cron: '56 21 * * *'   # w1 触发点 2
+    - cron: '57 21 * * *'   # w1 触发点 3
+    - cron: '2 22 * * *'   # w1 触发点 4
+    - cron: '14 22 * * *'   # w1 触发点 5
+    - cron: '30 22 * * *'   # w1 触发点 6
+    - cron: '40 22 * * *'   # w1 触发点 7
+    - cron: '54 22 * * *'   # w1 触发点 8
+
+    # ==== w2：北京时间 07:00-09:00（每天总量 70-90，本波 30-50，2026-W45 抽点）====
+    - cron: '25 0 * * *'   # w2 触发点 1
+    - cron: '36 0 * * *'   # w2 触发点 2
+    - cron: '37 0 * * *'   # w2 触发点 3
+    - cron: '38 0 * * *'   # w2 触发点 4
+    - cron: '55 0 * * *'   # w2 触发点 5
+    - cron: '26 23 * * *'   # w2 触发点 6
+    - cron: '33 23 * * *'   # w2 触发点 7
+    - cron: '45 23 * * *'   # w2 触发点 8
+
+    # ==== w3：北京时间 09:00-11:00（每天总量 70-90，本波 100%跑完剩余，2026-W45 抽点）====
+    - cron: '19 1 * * *'   # w3 触发点 1
+    - cron: '23 1 * * *'   # w3 触发点 2
+    - cron: '24 1 * * *'   # w3 触发点 3
+    - cron: '45 1 * * *'   # w3 触发点 4
+    - cron: '4 2 * * *'   # w3 触发点 5
+    - cron: '9 2 * * *'   # w3 触发点 6
+    - cron: '11 2 * * *'   # w3 触发点 7
+    - cron: '14 2 * * *'   # w3 触发点 8
 
 permissions:
   contents: read
 
+concurrency:
+  group: e5-keepalive
+  cancel-in-progress: false
+
 jobs:
-  bootstrap:
+  keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 15
     steps:
-      - name: 提示
+      # 抽签步骤：没中签的触发点在这里几秒退出，不产生实质消耗
+      - name: Decide slot
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
-          echo "调度尚未生成。请先运行 Actions -> Rebuild Schedule -> Run workflow，"
-          echo "本文件会被自动生成的正式调度替换。"
-          exit 1
+          python3 - <<'PYEOF'
+          import hashlib
+          import os
+          from datetime import datetime, timedelta, timezone
+
+          # (UTC小时, UTC分钟) -> (波次名, 槽位号, 是否末波, 是否推送, 本波百分比)。由生成器注入
+          SLOTS = {
+            (0, 25): ('w2', 0, 'false', 'false', '30-50'),
+            (0, 36): ('w2', 1, 'false', 'false', '30-50'),
+            (0, 37): ('w2', 2, 'false', 'false', '30-50'),
+            (0, 38): ('w2', 3, 'false', 'false', '30-50'),
+            (0, 55): ('w2', 4, 'false', 'false', '30-50'),
+            (1, 19): ('w3', 0, 'true', 'true', 'rest'),
+            (1, 23): ('w3', 1, 'true', 'true', 'rest'),
+            (1, 24): ('w3', 2, 'true', 'true', 'rest'),
+            (1, 45): ('w3', 3, 'true', 'true', 'rest'),
+            (2, 4): ('w3', 4, 'true', 'true', 'rest'),
+            (2, 9): ('w3', 5, 'true', 'true', 'rest'),
+            (2, 11): ('w3', 6, 'true', 'true', 'rest'),
+            (2, 14): ('w3', 7, 'true', 'true', 'rest'),
+            (21, 49): ('w1', 0, 'false', 'false', '30-50'),
+            (21, 56): ('w1', 1, 'false', 'false', '30-50'),
+            (21, 57): ('w1', 2, 'false', 'false', '30-50'),
+            (22, 2): ('w1', 3, 'false', 'false', '30-50'),
+            (22, 14): ('w1', 4, 'false', 'false', '30-50'),
+            (22, 30): ('w1', 5, 'false', 'false', '30-50'),
+            (22, 40): ('w1', 6, 'false', 'false', '30-50'),
+            (22, 54): ('w1', 7, 'false', 'false', '30-50'),
+            (23, 26): ('w2', 5, 'false', 'false', '30-50'),
+            (23, 33): ('w2', 6, 'false', 'false', '30-50'),
+            (23, 45): ('w2', 7, 'false', 'false', '30-50'),
+          }
+          N_POINTS = 8
+
+          event = os.environ.get("EVENT", "")
+          schedule = os.environ.get("SCHEDULE", "")
+
+          if event != "schedule":
+              run, notify, window, is_last, pct = "true", "true", "manual", "true", "rest"
+              print("手动触发 -> window=manual（照跑 + 推送）")
+          else:
+              parts = schedule.split()
+              key = (int(parts[1]), int(parts[0]))   # cron 格式：分 时 * * *
+              wave, slot, is_last, notify, pct = SLOTS.get(key, ("unknown", -1, "true", "false", "rest"))
+              date = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+              chosen = int(hashlib.sha256(f"pick|{date}|{wave}".encode()).hexdigest(), 16) % N_POINTS
+              run = "true" if slot == chosen else "false"
+              print(f"schedule={schedule!r} wave={wave} slot={slot} chosen={chosen} pct={pct} -> run={run}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"run={run}\nnotify={notify}\nwindow={window}\nis_last={is_last}\npercent={pct}\n")
+          PYEOF
+
+      - name: Checkout
+        if: steps.decide.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        if: steps.decide.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.decide.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      # 取回今天的账本（昨天的会自动作废）
+      - name: Restore daily state
+        if: steps.decide.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .e5_state.json
+          key: e5-state-${{ github.run_id }}
+          restore-keys: |
+            e5-state-
+
+      - name: Run keepalive
+        if: steps.decide.outputs.run == 'true'
+        env:
+          # ---- 运行场次（由 Decide slot 输出）----
+          RUN_WINDOW: ${{ steps.decide.outputs.window }}
+          IS_LAST: ${{ steps.decide.outputs.is_last }}
+          WAVE_PERCENT: ${{ steps.decide.outputs.percent }}
+          # ---- E5 账户（JSON 内 daily_calls 已失效，每天总量统一来自 schedule.yml）----
+          E5_ACCOUNTS: ${{ secrets.E5_ACCOUNTS }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TARGET_USERS: ${{ vars.TARGET_USERS }}
+          DAILY_CALLS: "70-90"
+          MIN_CALLS: ${{ vars.MIN_CALLS }}
+          MAX_CALLS: ${{ vars.MAX_CALLS }}
+          ENABLE_WRITES: ${{ vars.ENABLE_WRITES }}
+          # ---- 通知 ----
+          NOTIFY_ENABLED: ${{ steps.decide.outputs.notify }}
+          NOTIFY_SERVERCHAN_KEY: ${{ secrets.NOTIFY_SERVERCHAN_KEY }}
+          NOTIFY_TELEGRAM_BOT_TOKEN: ${{ secrets.NOTIFY_TELEGRAM_BOT_TOKEN }}
+          NOTIFY_TELEGRAM_CHAT_ID: ${{ secrets.NOTIFY_TELEGRAM_CHAT_ID }}
+          NOTIFY_SMTP_HOST: ${{ secrets.NOTIFY_SMTP_HOST }}
+          NOTIFY_SMTP_PORT: ${{ secrets.NOTIFY_SMTP_PORT }}
+          NOTIFY_SMTP_USER: ${{ secrets.NOTIFY_SMTP_USER }}
+          NOTIFY_SMTP_PASS: ${{ secrets.NOTIFY_SMTP_PASS }}
+          NOTIFY_SMTP_TO: ${{ secrets.NOTIFY_SMTP_TO }}
+        run: python main.py
+
+      # 保存今天的账本（即使运行失败也保存）
+      - name: Save daily state
+        if: always() && steps.decide.outputs.run == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .e5_state.json
+          key: e5-state-${{ github.run_id }}
