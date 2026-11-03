@@ -4,7 +4,8 @@ E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
 - 预算模型：每账户每天恰好 N 次请求；N 来自 schedule.yml 的 plan_min~plan_max，每天抽一次
 - 波次由 schedule.yml 定义：每波执行当天总量的指定百分比，末波跑完剩余并推送
-- 账本按北京日期跨波次累计，持久化在 .e5_state.json
+- 账本按北京日期跨波次累计，持久化在 .e5_state.json；崩溃时已执行次数也会记账
+- 网络超时/连接异常自动退避重试，不影响同账户后续动作
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
 - 推送附带订阅状态、到期时间、今日请求累计
 - 日志脱敏：UPN / GUID / 密码自动打码（REDACT_LOGS=false 可关闭）
@@ -236,16 +237,19 @@ class TokenProvider:
         if self._token and time.time() < self._expires_at - 120:
             return self._token
         url = TOKEN_ENDPOINT.format(tenant=self.acc.tenant_id)
-        resp = requests.post(
-            url,
-            data={
-                "grant_type": "client_credentials",
-                "client_id": self.acc.client_id,
-                "client_secret": self.acc.client_secret,
-                "scope": "https://graph.microsoft.com/.default",
-            },
-            timeout=30,
-        )
+        try:
+            resp = requests.post(
+                url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self.acc.client_id,
+                    "client_secret": self.acc.client_secret,
+                    "scope": "https://graph.microsoft.com/.default",
+                },
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"获取 token 网络异常: {exc.__class__.__name__}")
         if resp.status_code >= 400:
             raise RuntimeError(f"获取 token 失败: {resp.status_code} {resp.text[:200]}")
         payload = resp.json()
@@ -256,7 +260,7 @@ class TokenProvider:
 
 
 # --------------------------------------------------------------------------- #
-# Graph 客户端（重试 + 统计）
+# Graph 客户端（重试 + 统计；超时/网络异常同样退避重试）
 # --------------------------------------------------------------------------- #
 class GraphClient:
     def __init__(self, tokens: TokenProvider) -> None:
@@ -269,13 +273,23 @@ class GraphClient:
     def call(self, method: str, path: str, **kwargs) -> requests.Response | None:
         url = path if path.startswith("http") else GRAPH + path
         for attempt in range(1, 4):
-            resp = self.http.request(
-                method,
-                url,
-                headers={"Authorization": f"Bearer {self.tokens.get()}"},
-                timeout=30,
-                **kwargs,
-            )
+            try:
+                resp = self.http.request(
+                    method,
+                    url,
+                    headers={"Authorization": f"Bearer {self.tokens.get()}"},
+                    timeout=30,
+                    **kwargs,
+                )
+            except requests.RequestException as exc:
+                # 超时 / 连接失败等网络问题：退避后重试，绝不让单次抖动中断账户
+                wait = 2 ** attempt
+                log.warning(
+                    "%s %s 网络异常（%s），%ss 后重试",
+                    method, path, exc.__class__.__name__, wait,
+                )
+                time.sleep(wait)
+                continue
             if resp.status_code == 401:
                 log.warning("401，刷新 token 后重试")
                 self.tokens.invalidate()
@@ -322,7 +336,7 @@ def _plain_get(tokens: TokenProvider, path: str):
             timeout=30,
         )
     except Exception as exc:
-        log.info("订阅信息查询异常，已忽略: %s", exc)
+        log.info("订阅信息查询异常，已忽略: %s", exc.__class__.__name__)
         return None
     if resp.ok:
         return resp.json()
@@ -542,6 +556,7 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
         "req_run": 0, "req_target": 0, "req_used": 0,
     }
     log.info("—— 开始处理账户 [%s] ——", acc.name)
+    done_req = 0   # 已实际执行的请求数（崩溃时用于部分记账）
     try:
         client = GraphClient(TokenProvider(acc))
         users = resolve_users(client, acc)
@@ -641,12 +656,16 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
             kind = job[0]
             if kind == "GET":
                 client.call("GET", job[1])
+                done_req += 1
             elif kind == "DRAFT":
                 write_draft(client, job[1])
+                done_req += 2
             elif kind == "EVENT":
                 write_event(client, job[1])
+                done_req += 2
             elif kind == "FOLDER":
                 write_folder(client, job[1])
+                done_req += 2
             if i < len(selected):
                 time.sleep(random.uniform(0.6, 2.8))
 
@@ -658,6 +677,11 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
     except Exception as exc:  # 单个账户出错不影响其他账户
         log.error("[%s] 处理失败：%s", acc.name, exc)
         result["error"] = str(exc)
+        # 中途出错也要把已执行的请求记账，避免下次补跑导致超额
+        if done_req and acc.daily_max > 0:
+            usage[acc.name] = int(usage.get(acc.name, 0)) + done_req
+            result["req_used"] = usage[acc.name]
+        result["req_run"] = done_req
     return result
 
 
@@ -678,7 +702,7 @@ def send_notification(title: str, body: str) -> None:
             )
             log.info("Server酱推送: %s", "成功" if r.ok else f"失败 {r.status_code}")
         except Exception as exc:
-            log.warning("Server酱推送异常: %s", exc)
+            log.warning("Server酱推送异常: %s", exc.__class__.__name__)
 
     tg_token = os.getenv("NOTIFY_TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat = os.getenv("NOTIFY_TELEGRAM_CHAT_ID", "").strip()
@@ -691,7 +715,7 @@ def send_notification(title: str, body: str) -> None:
             )
             log.info("Telegram 推送: %s", "成功" if r.ok else f"失败 {r.status_code}")
         except Exception as exc:
-            log.warning("Telegram 推送异常: %s", exc)
+            log.warning("Telegram 推送异常: %s", exc.__class__.__name__)
 
     smtp_host = os.getenv("NOTIFY_SMTP_HOST", "").strip()
     if smtp_host:
@@ -717,7 +741,7 @@ def send_notification(title: str, body: str) -> None:
                     s.send_message(msg)
             log.info("邮件通知已发送给 %s", to)
         except Exception as exc:
-            log.warning("邮件通知异常: %s", exc)
+            log.warning("邮件通知异常: %s", exc.__class__.__name__)
 
 
 def write_step_summary(md: str) -> None:
@@ -768,7 +792,10 @@ def main() -> int:
     lines = []
     for r in results:
         if r["error"]:
-            lines.append(f"- **{r['name']}**：出错 —— {r['error']}")
+            seg = f"- **{r['name']}**：出错 —— {r['error']}"
+            if r["req_run"]:
+                seg += f"（中断前已执行 {r['req_run']} 次，已记账）"
+            lines.append(seg)
         else:
             seg = (
                 f"- **{r['name']}**：用户 {r['users']} 个，成功 {r['ok']}，"
