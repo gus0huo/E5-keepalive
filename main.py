@@ -2,10 +2,10 @@
 """
 E5 KeepAlive — AutoApiSecret 风格的 E5 开发活跃度维持脚本
 - 多 E5 账户：secret E5_ACCOUNTS（JSON 数组），单账户模式向后兼容
-- 预算模型：每账户每天恰好 N 次请求；N 可固定(80)或区间随机("70-90"，每天抽一次)
-- 三波运行：每波跑剩余的 30%~50%，末波跑完剩余并推送；账本按北京日期累计
+- 预算模型：每账户每天恰好 N 次请求；N 来自 schedule.yml 的 plan_min~plan_max，每天抽一次
+- 波次由 schedule.yml 定义：每波执行当天总量的指定百分比，末波跑完剩余并推送
+- 账本按北京日期跨波次累计，持久化在 .e5_state.json
 - 运行结果通知：GitHub Step Summary + Server酱 / Telegram / SMTP 邮件（任选）
-- 通过 NOTIFY_ENABLED 控制是否推送（前两波静默，仅末波推送）
 - 推送附带订阅状态、到期时间、今日请求累计
 - 日志脱敏：UPN / GUID / 密码自动打码（REDACT_LOGS=false 可关闭）
 - 写操作即建即删；404/507 跳过；429/5xx 退避重试
@@ -78,8 +78,8 @@ class Account:
     client_id: str
     client_secret: str
     users: list[str] = field(default_factory=list)  # 空 = 租户内前 25 个用户
-    daily_min: int = 80          # 每天总请求数下限
-    daily_max: int = 80          # 每天总请求数上限（= 下限则为固定值；均为 0 退回随机模式）
+    daily_min: int = 70          # 每天总请求数下限（来自 schedule.yml 的 plan_min）
+    daily_max: int = 90          # 每天总请求数上限（来自 schedule.yml 的 plan_max）
     runs_per_day: int = 3        # 每天跑几波（仅用于日志参考）
     min_calls: int = 18          # 旧随机模式用，daily 为 0 时生效
     max_calls: int = 36
@@ -96,7 +96,7 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
-def _parse_calls(value, default: tuple[int, int] = (80, 80)) -> tuple[int, int]:
+def _parse_calls(value, default: tuple[int, int] = (70, 90)) -> tuple[int, int]:
     """解析请求数：80 → (80, 80)；"70-90" → (70, 90)；非法值回退默认。"""
     if value is None or isinstance(value, bool):
         return default
@@ -137,7 +137,12 @@ def load_accounts() -> list[Account]:
                 log.error("%s 第 %d 行: %s", marker, i, raw_lines[i - 1])
             sys.exit(2)
         for i, it in enumerate(items, 1):
-            dmin, dmax = _parse_calls(it.get("daily_calls"), env_calls)
+            if "daily_calls" in it:
+                log.info(
+                    "[%s] daily_calls 字段已失效，每天总量统一由 schedule.yml 管理",
+                    it.get("name") or f"账户{i}",
+                )
+            dmin, dmax = env_calls   # 每天总量区间来自 schedule.yml（DAILY_CALLS 环境变量）
             accounts.append(
                 Account(
                     name=it.get("name") or f"账户{i}",
@@ -552,10 +557,16 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
         if expiry:
             log.info("[%s] 到期时间: %s", acc.name, expiry)
 
-        # ---- 预算：非末波跑剩余的 30%~50%，末波跑完剩余 ----
+        # ---- 预算：本波执行【当天总量】的 WAVE_PERCENT 百分比，末波跑完剩余 ----
         used_so_far = int(usage.get(acc.name, 0))
         window = os.getenv("RUN_WINDOW", "").strip().lower()
-        is_last_wave = window in ("w3", "pm", "manual")  # 末波 / 手动 = 跑完剩余
+        is_last_env = os.getenv("IS_LAST", "").strip().lower()
+        if is_last_env in ("true", "false"):
+            is_last_wave = is_last_env == "true"
+        else:
+            is_last_wave = window in ("w3", "pm", "manual")  # 兼容旧版配置
+        pct_spec = os.getenv("WAVE_PERCENT", "").strip().lower()
+
         if acc.daily_max > 0:
             target = int(targets.get(acc.name, 0))
             if not target:
@@ -577,20 +588,29 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
                 result["req_used"] = used_so_far
                 result.update(ok=client.ok, fail=client.fail, skip=client.skip)
                 return result
-            if is_last_wave:
+
+            if is_last_wave or pct_spec == "rest":
+                # 末波（或手测）：跑完剩余，保证每天恰好完成当天总量
                 run_budget = remaining
                 log.info(
                     "[%s] 末波：跑完剩余 %d 次（目标 %d，已用 %d）",
                     acc.name, remaining, target, used_so_far,
                 )
             else:
-                lo = max(1, remaining * 3 // 10)
-                hi = max(lo, remaining * 5 // 10)
-                run_budget = random.randint(lo, hi)
+                # 本波执行【当天总量】的 lo%~hi%（如 "30-50" 或 "40"），不超过剩余
+                m = re.match(r"^(\d{1,3})(?:-(\d{1,3}))?$", pct_spec)
+                if m:
+                    lo_pct = int(m.group(1))
+                    hi_pct = int(m.group(2) or m.group(1))
+                else:
+                    lo_pct, hi_pct = 30, 50
+                lo = max(1, target * lo_pct // 100)
+                hi = max(lo, target * hi_pct // 100)
+                run_budget = min(remaining, random.randint(lo, hi))
                 log.info(
-                    "[%s] 本次跑 %d 个请求，剩余 %d 个留给后续波次（目标 %d，已用 %d）",
-                    acc.name, run_budget, target - used_so_far - run_budget,
-                    target, used_so_far,
+                    "[%s] 本次跑 %d 个请求（目标 %d 的 %d~%d%%），剩余 %d 个留给后续波次",
+                    acc.name, run_budget, target, lo_pct, hi_pct,
+                    target - used_so_far - run_budget,
                 )
         else:
             run_budget = random.randint(acc.min_calls, acc.max_calls)
@@ -599,7 +619,7 @@ def process_account(acc: Account, usage: dict, targets: dict) -> dict:
         base, remainder = divmod(run_budget, len(users))
         if base == 0:
             log.warning(
-                "[%s] 每用户预算过低（%d），建议提高 daily_calls 或减少 users",
+                "[%s] 每用户预算过低（%d），建议提高 plan 或减少 users",
                 acc.name, base,
             )
 
@@ -760,7 +780,7 @@ def main() -> int:
                     f"（本次 {r['req_run']}）"
                 )
             else:
-                seg += f" ｜ 本次 {r['req_run']} 次（随机预算模式）"
+                seg += f" ｜ 本次 {r['req_run']} 次（不计入每日预算）"
             seg += f" ｜ {r.get('sub') or '订阅状态未查到'}"
             seg += f" ｜ 到期 {r.get('expiry') or '未查到（配置 expiry 或等微软邮件）'}"
             lines.append(seg)
@@ -773,7 +793,7 @@ def main() -> int:
     if notify_on:
         send_notification(title, body)
     else:
-        log.info("本次为前两波，按设置不推送（每天仅末波运行后推送）")
+        log.info("本次为非推送波次，按设置不推送（每天仅末波运行后推送）")
 
     log.info("执行完毕: %s", title)
     if os.getenv("GITHUB_ACTIONS") == "true":
