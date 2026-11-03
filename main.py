@@ -384,7 +384,7 @@ def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str
     """返回 (订阅状态摘要, 到期时间线索)。查不到就返回空串。"""
     today = _today_key()
 
-    # 1) 订阅状态与席位
+    # 1) 订阅状态与席位（只显示 E5 订阅相关 SKU，过滤 Power Automate/Power BI 等免费陪跑项）
     sub = ""
     data = _plain_get(
         tokens,
@@ -393,9 +393,12 @@ def get_subscription_info(acc: Account, tokens: TokenProvider, fallback_uid: str
     if data:
         bits = []
         for s in data.get("value", []):
+            sku = s.get("skuPartNumber", "?")
+            if "DEVELOPER" not in sku.upper():
+                continue
             enabled = (s.get("prepaidUnits") or {}).get("enabled") or 0
             bits.append(
-                f"{s.get('skuPartNumber', '?')} {s.get('capabilityStatus', '?')}"
+                f"{sku} {s.get('capabilityStatus', '?')}"
                 f"（{s.get('consumedUnits', 0)}/{enabled} 席）"
             )
         sub = "；".join(bits)
