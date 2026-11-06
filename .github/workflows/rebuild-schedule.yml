@@ -14,14 +14,14 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           # 用 PAT 检出：这样后面 git push 用的也是它，
           # 才有权限修改 .github/workflows/ 下的文件（GITHUB_TOKEN 被 GitHub 禁止）
           token: ${{ secrets.REPO_TOKEN }}
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
