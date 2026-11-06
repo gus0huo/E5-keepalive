@@ -232,11 +232,11 @@ jobs:
 
       - name: Checkout
         if: steps.decide.outputs.run == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
         if: steps.decide.outputs.run == 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -247,7 +247,7 @@ jobs:
       # 取回今天的账本（昨天的会自动作废）
       - name: Restore daily state
         if: steps.decide.outputs.run == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .e5_state.json
           key: e5-state-${{ github.run_id }}
@@ -286,7 +286,7 @@ jobs:
       # 保存今天的账本（即使运行失败也保存）
       - name: Save daily state
         if: always() && steps.decide.outputs.run == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .e5_state.json
           key: e5-state-${{ github.run_id }}
